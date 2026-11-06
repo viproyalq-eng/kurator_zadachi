@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import time
 from zoneinfo import ZoneInfo
 
+from .texts import TEAM_USERNAMES as DEFAULT_TEAM_USERNAMES
 from .texts import WELCOME_TEXT as DEFAULT_WELCOME_TEXT
 
 
@@ -30,6 +32,11 @@ class Config:
     curator_name: str = "Віктор"
     timezone: ZoneInfo = field(default_factory=lambda: ZoneInfo("Europe/Kyiv"))
     sheet_flush_seconds: int = 5
+    tasks_chat_id: int | None = None
+    tasks_time: time = field(default_factory=lambda: time(7, 0))
+    tasks_per_day: int = 20
+    tasks_min_days: int = 10
+    team_usernames: set[str] = field(default_factory=set)
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -89,6 +96,42 @@ def load_config(env: dict | None = None) -> Config:
         warnings.append(f"Невідомий TIMEZONE {tz_name!r}, використовую Europe/Kyiv.")
         tz = ZoneInfo("Europe/Kyiv")
 
+    tasks_chat_id = None
+    tasks_raw = (env.get("TASKS_CHAT_ID") or "").strip()
+    if tasks_raw:
+        try:
+            tasks_chat_id = int(tasks_raw)
+        except ValueError:
+            warnings.append(f"TASKS_CHAT_ID має бути числом (з мінусом), зараз: {tasks_raw!r}")
+    if tasks_chat_id is None:
+        warnings.append("Не задано TASKS_CHAT_ID — щоденні задачі надсилатимуться адмінам, а не в групу.")
+
+    tasks_time = time(7, 0)
+    time_raw = (env.get("TASKS_TIME") or "").strip()
+    if time_raw:
+        try:
+            h, m = time_raw.split(":")
+            tasks_time = time(int(h), int(m))
+        except ValueError:
+            warnings.append(f"TASKS_TIME має бути у форматі 07:00, зараз: {time_raw!r}")
+
+    def _int(name: str, default: int) -> int:
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+        warnings.append(f"{name} має бути додатним числом, зараз: {raw!r}. Використовую {default}.")
+        return default
+
+    team_raw = env.get("EXCLUDED_USERNAMES")
+    team_list = team_raw.split(",") if team_raw is not None else DEFAULT_TEAM_USERNAMES
+    team = {u.strip().lstrip("@").lower() for u in team_list if u.strip().lstrip("@")}
+
     return Config(
         bot_token=token,
         db_path=(env.get("DB_PATH") or "bot.db").strip(),
@@ -99,5 +142,10 @@ def load_config(env: dict | None = None) -> Config:
         bonus_keywords=keywords or ["бонус"],
         curator_name=(env.get("CURATOR_NAME") or "Віктор").strip(),
         timezone=tz,
+        tasks_chat_id=tasks_chat_id,
+        tasks_time=tasks_time,
+        tasks_per_day=_int("TASKS_PER_DAY", 20),
+        tasks_min_days=_int("TASKS_MIN_DAYS", 10),
+        team_usernames=team,
         warnings=warnings,
     )

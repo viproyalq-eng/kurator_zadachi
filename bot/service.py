@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from .config import Config
-from .db import CLIENT_NEW, CLIENT_OLD, Client, Database
+from .db import CLIENT_NEW, CLIENT_OLD, Client, Database, Task
 from .logic import SENDER_BOT, SENDER_CLIENT, fmt_dt, is_bonus
+from .sheets import TASKS_TAB
+from .tasks import cutoff_utc, task_row
 from .notify import Notifier
 
 log = logging.getLogger(__name__)
@@ -83,6 +85,8 @@ class BotService:
             )
         elif wants_welcome:
             client.client_type = CLIENT_NEW
+        if self.is_team(msg.client_username):
+            client.excluded = 1
         client.business_connection_id = msg.business_connection_id
         client.name = msg.client_name or client.name
         client.username = msg.client_username or client.username
@@ -90,6 +94,11 @@ class BotService:
         client.last_from = sender
         self.db.upsert_client(client)
         self._queue_rows(client, sender, msg.text, msg.date)
+
+        if sender == self.cfg.curator_name:
+            # Віктор написав клієнту — відкриті задачі по цьому чату виконано.
+            for task in self.db.mark_tasks_done(client.chat_id, msg.date.isoformat()):
+                self._queue_task(task)
 
         if wants_welcome:
             await self._send_welcome(client)
@@ -117,6 +126,37 @@ class BotService:
         self.db.upsert_client(client)
         self._queue_rows(client, SENDER_BOT, self.cfg.welcome_text, date)
 
+    def is_team(self, username: str | None) -> bool:
+        return bool(username) and username.lower() in self.cfg.team_usernames
+
+    # --- щоденні задачі ---
+    def create_daily_tasks(self, task_date: str, now_utc: datetime) -> list[Task]:
+        """Створює задачі на день (якщо ще не створені) і повертає їх."""
+        if not self.db.has_tasks(task_date):
+            self.db.exclude_usernames(self.cfg.team_usernames)
+            cutoff = cutoff_utc(now_utc, self.cfg.tasks_min_days).isoformat()
+            clients = self.db.task_candidates(cutoff, self.cfg.tasks_per_day)
+            self.db.create_tasks(task_date, clients, now_utc.isoformat())
+            for task in self.db.tasks_for(task_date):
+                self._queue_task(task)
+        return self.db.tasks_for(task_date)
+
+    def apply_not_client_flags(self, flags: dict[int, bool]) -> int:
+        """Переносить позначки «Не клієнт» з таблиці в базу. Повертає, скільки змінилося."""
+        changed = 0
+        for chat_id, flag in flags.items():
+            client = self.db.get_client(chat_id)
+            if client is None:
+                continue
+            excluded = flag or self.is_team(client.username)
+            if self.db.set_excluded(chat_id, excluded):
+                changed += 1
+        return changed
+
+    def _queue_task(self, task: Task) -> None:
+        if self.sheets:
+            self.sheets.queue_upsert(TASKS_TAB, task_row(task, self.cfg.timezone))
+
     @staticmethod
     def _client_label(client: Client) -> str:
         return f"{client.name} (@{client.username})" if client.username else f"{client.name}"
@@ -129,7 +169,8 @@ class BotService:
             fmt_dt(date, tz), client.name or "", f"@{client.username}" if client.username else "",
             str(client.chat_id), sender, text,
         ])
-        self.sheets.queue_client(client.chat_id, client_row(client, tz))
+        row = client_row(client, tz)
+        self.sheets.queue_client(client.chat_id, row, row + ["так" if client.excluded else ""])
 
 
 def _fmt_iso(value: str | None, tz) -> str:

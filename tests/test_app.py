@@ -112,7 +112,7 @@ async def test_commands(app):
 
 
 async def test_handlers_registered(app):
-    assert len(app.application.handlers[0]) == 6
+    assert len(app.application.handlers[0]) == 9
 
 
 async def test_sheet_failure_notifies_once_then_recovers(app):
@@ -130,3 +130,128 @@ async def test_sheet_failure_notifies_once_then_recovers(app):
     app.sheets.fail = False
     await app._flush_sheets_once()
     assert "знову працює" in app.admin[-1]
+
+
+# --- група задач ---
+
+@pytest.fixture
+def sent_to(monkeypatch, app):
+    """Перехоплює всі send_message бота: список (chat_id, text)."""
+    class Calls(list):
+        behaviour: dict
+
+    calls = Calls()
+    behaviour = {}
+
+    async def fake_send(self, chat_id, text, **kwargs):
+        calls.append((chat_id, text))
+        err = behaviour.pop(chat_id, None)
+        if err:
+            raise err
+        return None
+
+    monkeypatch.setattr(type(app.application.bot), "send_message", fake_send)
+    calls.behaviour = behaviour
+    return calls
+
+
+async def test_tasks_go_to_admins_when_group_not_set(app, sent_to):
+    assert app.tasks_chat_id is None
+    await app.send_daily_tasks()
+    assert {c[0] for c in sent_to} == {1, 2}
+    assert any("Задачі на" in c[1] for c in sent_to)
+    assert any("TASKS_CHAT_ID" in m for m in app.admin)
+
+
+async def test_tasks_go_to_group(app, sent_to):
+    app.cfg.tasks_chat_id = -1001
+    await app.send_daily_tasks()
+    assert [c[0] for c in sent_to] == [-1001]
+
+
+async def test_group_migration_is_remembered(app, sent_to):
+    from telegram.error import ChatMigrated
+    app.cfg.tasks_chat_id = -5
+    sent_to.behaviour[-5] = ChatMigrated(-1009)
+    await app.send_daily_tasks()
+    assert [c[0] for c in sent_to] == [-5, -1009]
+    assert app.tasks_chat_id == -1009
+    assert any("-1009" in m for m in app.admin)
+
+
+async def test_group_send_failure_falls_back_to_admins(app, sent_to):
+    from telegram.error import Forbidden
+    app.cfg.tasks_chat_id = -1001
+    sent_to.behaviour[-1001] = Forbidden("bot is not a member")
+    await app.send_daily_tasks()
+    assert [c[0] for c in sent_to] == [-1001, 1, 2]
+    assert any("Не вдалося надіслати задачі" in m for m in app.admin)
+
+
+ADMIN_RIGHTS = {k: False for k in (
+    "can_be_edited", "is_anonymous", "can_manage_chat", "can_delete_messages", "can_manage_video_chats",
+    "can_restrict_members", "can_promote_members", "can_change_info", "can_invite_users",
+    "can_post_stories", "can_edit_stories", "can_delete_stories")}
+
+
+def member_update(status, chat_id=-1001, chat_type="supergroup"):
+    bot_user = {"id": 5, "is_bot": True, "first_name": "Bot", "username": "as_kurator_bot"}
+    data = {
+        "update_id": 9,
+        "my_chat_member": {
+            "chat": {"id": chat_id, "type": chat_type, "title": "Задачі куратора"},
+            "from": OWNER, "date": 1793952000,
+            "old_chat_member": {"user": bot_user, "status": "left"},
+            "new_chat_member": {"user": bot_user, "status": status, **(ADMIN_RIGHTS if status == "administrator" else {})},
+        },
+    }
+    return Update.de_json(data, None)
+
+
+async def test_bot_added_to_group_reports_id(app):
+    await app.on_my_chat_member(member_update("member"), SimpleNamespace())
+    assert "-1001" in app.admin[-1] and "TASKS_CHAT_ID" in app.admin[-1]
+    app.cfg.tasks_chat_id = -1001
+    await app.on_my_chat_member(member_update("administrator"), SimpleNamespace())
+    assert "Задачі надходитимуть сюди" in app.admin[-1]
+    await app.on_my_chat_member(member_update("left"), SimpleNamespace())
+    assert "вилучили" in app.admin[-1]
+
+
+async def test_cmd_tasks_permissions(app):
+    replies = []
+
+    async def reply(text, **kwargs):
+        replies.append(text)
+
+    def upd(chat_id, user_id):
+        return SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id),
+                               effective_user=SimpleNamespace(id=user_id),
+                               message=SimpleNamespace(reply_text=reply, reply_html=reply))
+
+    await app.cmd_tasks(upd(-777, 42), None)          # чужа група, не адмін
+    assert "працює в групі задач" in replies[-1]
+    app.cfg.tasks_chat_id = -1001
+    await app.cmd_tasks(upd(-1001, 42), None)         # група задач — будь-хто з учасників
+    assert "Задачі на" in replies[-1]
+    await app.cmd_tasks(upd(1, 1), None)              # адмін в особистих
+    assert "Задачі на" in replies[-1]
+
+
+async def test_scheduler_runs_once_per_day(app, sent_to, monkeypatch):
+    import bot.app as appmod
+    app.cfg.tasks_chat_id = -1001
+    from datetime import time
+    app.cfg.tasks_time = time(0, 0)  # «вже пора»
+    calls = []
+
+    async def fake_sleep(seconds):
+        calls.append(seconds)
+        if len(calls) >= 3:
+            raise asyncio.CancelledError
+
+    import asyncio
+    monkeypatch.setattr(appmod.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await app._scheduler_loop()
+    assert [c[0] for c in sent_to] == [-1001]   # три «тіки», а надіслано лише раз

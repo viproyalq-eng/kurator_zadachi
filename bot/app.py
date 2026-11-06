@@ -4,12 +4,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import traceback
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
-from telegram import BusinessConnection, Message, Update
-from telegram.error import Conflict, NetworkError, TimedOut
-from telegram.ext import (Application, BusinessConnectionHandler, CommandHandler, ContextTypes,
-                          MessageHandler, filters)
+from telegram import BusinessConnection, ChatMember, Message, Update
+from telegram.constants import ParseMode
+from telegram.error import ChatMigrated, Conflict, NetworkError, TimedOut
+from telegram.ext import (Application, BusinessConnectionHandler, ChatMemberHandler, CommandHandler,
+                          ContextTypes, MessageHandler, filters)
 
 from .config import Config
 from .db import Connection, Database
@@ -17,11 +18,15 @@ from .logic import client_display_name, message_text
 from .notify import Notifier
 from .service import BotService, IncomingMessage
 from .sheets import SheetWriter
+from .tasks import LAST_RUN_KEY, format_tasks_message, is_due
 
 log = logging.getLogger(__name__)
 
 SHEETS_ERROR_COOLDOWN = 30 * 60
 ERROR_COOLDOWN = 5 * 60
+SCHEDULER_TICK = 30           # як часто перевіряти, чи не пора надсилати задачі (сек)
+FLAGS_SYNC_SECONDS = 10 * 60  # як часто читати позначки «Не клієнт» з таблиці
+TASKS_CHAT_OVERRIDE_KEY = "tasks_chat_id_override"
 
 PRIVATE_ONLY = filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE
 
@@ -69,9 +74,111 @@ class BotApp:
         self.notifier = Notifier(cfg.admin_chat_ids, send_admin)
         self.service = BotService(cfg, self.db, self.sheets, self.notifier,
                                   send=self._send_as_curator, resolve_owner=self._resolve_owner)
-        self._flush_task: asyncio.Task | None = None
+        self._background: list[asyncio.Task] = []
         self._sheets_failing = False
         self._register()
+
+    # --- група «Задачі куратора» ---
+    @property
+    def tasks_chat_id(self) -> int | None:
+        override = self.db.get_setting(TASKS_CHAT_OVERRIDE_KEY)
+        return int(override) if override else self.cfg.tasks_chat_id
+
+    def _remember_migration(self, old_id: int, new_id: int) -> bool:
+        if old_id == self.tasks_chat_id:
+            self.db.set_setting(TASKS_CHAT_OVERRIDE_KEY, str(new_id))
+            return True
+        return False
+
+    async def send_to_tasks_chat(self, text: str) -> bool:
+        """Надсилає в групу задач. Якщо групу не задано — адмінам, щоб нічого не загубилося."""
+        chat_id = self.tasks_chat_id
+        if chat_id is None:
+            await self.notifier.notify(
+                "ℹ️ Групу задач ще не налаштовано (змінна TASKS_CHAT_ID), тому надсилаю вам:",
+                key="no_tasks_chat", cooldown=12 * 3600)
+            return await self._notify_html(text)
+        bot = self.application.bot
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True)
+            return True
+        except ChatMigrated as e:
+            # Група стала «супергрупою» і отримала новий ID — запам'ятовуємо й пробуємо ще раз.
+            self._remember_migration(chat_id, e.new_chat_id)
+            await self.notifier.notify(
+                f"ℹ️ Група задач змінила ID: {chat_id} → {e.new_chat_id}. Бот уже користується новим, "
+                f"але оновіть, будь ласка, змінну TASKS_CHAT_ID у Railway на {e.new_chat_id}.")
+            await bot.send_message(chat_id=e.new_chat_id, text=text, parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.exception("Не вдалося надіслати в групу задач")
+            await self.notifier.notify(
+                f"⚠️ Не вдалося надіслати задачі в групу ({chat_id}): {type(e).__name__}: {e}\n"
+                f"Перевірте, що бот є учасником групи «Задачі куратора» і ID правильний (з мінусом). "
+                f"Задачі нижче:", key="tasks_send", cooldown=600)
+            await self._notify_html(text)
+            return False
+
+    async def _notify_html(self, text: str) -> bool:
+        bot = self.application.bot
+        ok = False
+        for chat_id in self.cfg.admin_chat_ids:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                                       disable_web_page_preview=True)
+                ok = True
+            except Exception:  # noqa: BLE001
+                log.exception("Не вдалося надіслати адміну %s", chat_id)
+        return ok
+
+    def _today_local(self) -> date:
+        return datetime.now(self.cfg.timezone).date()
+
+    async def _sync_not_client_flags(self) -> None:
+        if not self.sheets:
+            return
+        try:
+            flags = await asyncio.to_thread(self.sheets.read_not_client_flags)
+        except Exception:  # noqa: BLE001 — не критично: використаємо те, що вже є в базі
+            log.exception("Не вдалося прочитати позначки «Не клієнт»")
+            return
+        changed = self.service.apply_not_client_flags(flags)
+        if changed:
+            log.info("Оновлено позначки «Не клієнт»: %s", changed)
+
+    async def send_daily_tasks(self, *, header: str | None = None) -> None:
+        await self._sync_not_client_flags()
+        now = datetime.now(timezone.utc)
+        today = self._today_local()
+        tasks = self.service.create_daily_tasks(today.isoformat(), now)
+        y_tasks = self.db.tasks_for((today - timedelta(days=1)).isoformat())
+        yesterday = (sum(1 for t in y_tasks if t.done_at), len(y_tasks)) if y_tasks else None
+        text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days,
+                                    yesterday=yesterday, header=header)
+        await self.send_to_tasks_chat(text)
+
+    async def _scheduler_loop(self) -> None:
+        last_flags_sync = 0.0
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                now_local = datetime.now(self.cfg.timezone)
+                if is_due(now_local, self.cfg.tasks_time, self.db.get_setting(LAST_RUN_KEY)):
+                    # Позначаємо одразу, щоб у разі помилки не надсилати список кожні 30 секунд.
+                    self.db.set_setting(LAST_RUN_KEY, now_local.date().isoformat())
+                    await self.send_daily_tasks()
+                elif self.sheets and loop.time() - last_flags_sync > FLAGS_SYNC_SECONDS:
+                    last_flags_sync = loop.time()
+                    await self._sync_not_client_flags()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.exception("Помилка в розкладі задач")
+                await self.notifier.notify(f"⚠️ Помилка під час формування задач: {type(e).__name__}: {e}",
+                                           key="scheduler", cooldown=ERROR_COOLDOWN)
+            await asyncio.sleep(SCHEDULER_TICK)
 
     # --- допоміжне для сервісу ---
     async def _send_as_curator(self, connection_id: str, chat_id: int, text: str):
@@ -97,6 +204,9 @@ class BotApp:
         app.add_handler(CommandHandler("id", self.cmd_id, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("chatid", self.cmd_chatid, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("status", self.cmd_status, filters=PRIVATE_ONLY))
+        app.add_handler(CommandHandler("tasks", self.cmd_tasks, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(ChatMemberHandler(self.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+        app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, self.on_migrate))
         app.add_error_handler(self.on_error)
 
     async def on_business_connection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -116,11 +226,54 @@ class BotApp:
             return
         await self.service.handle_message(incoming_from_tg(message))
 
+    async def on_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Бота додали в групу або вилучили з неї — повідомляємо адмінів разом з ID групи."""
+        change = update.my_chat_member
+        chat = change.chat
+        if chat.type not in ("group", "supergroup"):
+            return
+        status = change.new_chat_member.status
+        title = chat.title or "без назви"
+        if status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR):
+            if chat.id == self.tasks_chat_id:
+                await self.notifier.notify(f"✅ Бот у групі задач «{title}». Задачі надходитимуть сюди.")
+            else:
+                await self.notifier.notify(
+                    f"➕ Мене додали в групу «{title}».\nID групи: {chat.id}\n\n"
+                    f"Якщо це група для задач Віктора — впишіть це число (разом з мінусом) у змінну "
+                    f"TASKS_CHAT_ID у Railway і натисніть Deploy.")
+        elif status in (ChatMember.LEFT, ChatMember.BANNED):
+            await self.notifier.notify(f"➖ Мене вилучили з групи «{title}» (ID {chat.id}).")
+
+    async def on_migrate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        if message and message.migrate_to_chat_id:
+            old_id, new_id = message.chat.id, message.migrate_to_chat_id
+            if self._remember_migration(old_id, new_id):
+                await self.notifier.notify(
+                    f"ℹ️ Група задач змінила ID: {old_id} → {new_id}. Бот уже користується новим, "
+                    f"але оновіть змінну TASKS_CHAT_ID у Railway на {new_id}.")
+
+    async def cmd_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показати сьогоднішні задачі з позначками, що вже виконано."""
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id if update.effective_user else None
+        if chat_id != self.tasks_chat_id and user_id not in self.cfg.admin_chat_ids:
+            await update.message.reply_text("Ця команда працює в групі задач або для адмінів.")
+            return
+        await self._sync_not_client_flags()
+        now = datetime.now(timezone.utc)
+        today = self._today_local()
+        tasks = self.service.create_daily_tasks(today.isoformat(), now)
+        text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days)
+        await update.message.reply_html(text, disable_web_page_preview=True)
+
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "Привіт! Я бот куратора.\n\n"
             "/id — ваш Telegram ID\n"
             "/chatid — ID цього чату\n"
+            "/tasks — задачі на сьогодні\n"
             "/status — стан бота (лише для адміна)")
 
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -146,13 +299,21 @@ class BotApp:
         else:
             sheet_line = f"✅ працює, у черзі {self.sheets.pending_count()} рядків"
         welcome_line = "задано ✅" if self.cfg.welcome_text else "НЕ задано (WELCOME_TEXT)"
+        tasks_chat = self.tasks_chat_id
+        tasks_line = (f"група {tasks_chat}" if tasks_chat else "група НЕ задана (TASKS_CHAT_ID) — шлю адмінам")
+        today_tasks = self.db.tasks_for(self._today_local().isoformat())
+        done = sum(1 for t in today_tasks if t.done_at)
         await update.message.reply_text(
             "📊 Стан бота\n"
-            f"Клієнтів: {s['clients']} (нових {s['new_clients']}, старих {s['old_clients']})\n"
+            f"Клієнтів: {s['clients']} (нових {s['new_clients']}, старих {s['old_clients']}, "
+            f"не клієнтів {s['excluded']})\n"
             f"Повідомлень у базі: {s['messages']}\n"
             f"Надіслано привітань: {s['welcomes']}\n"
             f"Привітальний текст: {welcome_line}\n"
-            f"Таблиця: {sheet_line}")
+            f"Таблиця: {sheet_line}\n"
+            f"Задачі: щодня о {self.cfg.tasks_time.strftime('%H:%M')} ({self.cfg.tasks_per_day} шт., "
+            f"без контакту {self.cfg.tasks_min_days}+ днів), {tasks_line}\n"
+            f"Сьогодні виконано: {done} з {len(today_tasks)}")
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         err = context.error
@@ -196,6 +357,9 @@ class BotApp:
     async def _post_init(self, application: Application) -> None:
         me = await application.bot.get_me()
         lines = [f"✅ Бот @{me.username} запущено."]
+        tasks_chat = self.tasks_chat_id
+        lines.append(f"🗓 Задачі щодня о {self.cfg.tasks_time.strftime('%H:%M')} "
+                     + (f"у групу {tasks_chat}." if tasks_chat else "— група ще не задана, надсилатиму вам."))
         if self.sheets:
             try:
                 title = await asyncio.to_thread(self.sheets.check_connection)
@@ -208,11 +372,12 @@ class BotApp:
             lines.append(f"• {w}")
         await self.notifier.notify("\n".join(lines))
         if self.sheets:
-            self._flush_task = asyncio.create_task(self._flush_loop())
+            self._background.append(asyncio.create_task(self._flush_loop()))
+        self._background.append(asyncio.create_task(self._scheduler_loop()))
 
     async def _post_shutdown(self, application: Application) -> None:
-        if self._flush_task:
-            self._flush_task.cancel()
+        for task in self._background:
+            task.cancel()
         if self.sheets and self.sheets.pending_count():
             try:
                 await asyncio.to_thread(self.sheets.flush)

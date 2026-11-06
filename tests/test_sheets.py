@@ -1,6 +1,7 @@
 import pytest
 
-from bot.sheets import CLIENTS_HEADER, CLIENTS_TAB, MESSAGES_HEADER, MESSAGES_TAB, SheetWriter
+from bot.sheets import (CLIENTS_HEADER, CLIENTS_TAB, MESSAGES_HEADER, MESSAGES_TAB, TASKS_HEADER, TASKS_TAB,
+                        SheetWriter)
 
 
 class FakeWS:
@@ -24,13 +25,19 @@ class FakeWS:
             raise RuntimeError("quota")
         self.rows.extend(list(r) for r in rows)
 
+    def get_all_values(self):
+        return [list(r) for r in self.rows]
+
     def col_values(self, n):
         return [r[n - 1] if len(r) >= n else "" for r in self.rows]
 
     def batch_update(self, updates, value_input_option=None):
         for u in updates:
             row_no = int(u["range"].split(":")[0][1:])
-            self.rows[row_no - 1] = list(u["values"][0])
+            new = list(u["values"][0])
+            old = self.rows[row_no - 1]
+            # як у справжній таблиці: змінюються лише стовпці з діапазону, решта лишається
+            self.rows[row_no - 1] = new + old[len(new):]
 
 
 class FakeSS:
@@ -68,6 +75,7 @@ def test_creates_tabs_with_headers(writer):
     assert w.check_connection() == "Віктор — статистика"
     assert ss.tabs[MESSAGES_TAB].rows[0] == MESSAGES_HEADER
     assert ss.tabs[CLIENTS_TAB].rows[0] == CLIENTS_HEADER
+    assert ss.tabs[TASKS_TAB].rows[0] == TASKS_HEADER
 
 
 def test_flush_messages_and_upsert_clients(writer):
@@ -105,3 +113,46 @@ def test_failure_keeps_rows_in_queue(writer):
 def test_empty_flush(writer):
     w, _ = writer
     assert w.flush() == 0
+
+
+def test_old_header_is_extended(writer):
+    w, ss = writer
+    ws = ss.add_worksheet(CLIENTS_TAB, 10, 9)
+    ws.rows.append(CLIENTS_HEADER[:9])
+    w.check_connection()
+    assert ss.tabs[CLIENTS_TAB].rows[0] == CLIENTS_HEADER
+
+
+def test_not_client_column_is_never_overwritten(writer):
+    w, ss = writer
+    w.queue_client(100, ["100", "Іван", "", "старий", "", "", "клієнт", "", ""],
+                   ["100", "Іван", "", "старий", "", "", "клієнт", "", "", ""])
+    w.flush()
+    ss.tabs[CLIENTS_TAB].rows[1][9] = "так"   # Віктор поставив позначку
+    w.queue_client(100, ["100", "Іван", "", "старий", "", "", "Віктор", "", ""])
+    w.flush()
+    assert ss.tabs[CLIENTS_TAB].rows[1][6] == "Віктор"
+    assert ss.tabs[CLIENTS_TAB].rows[1][9] == "так"
+    assert w.read_not_client_flags() == {100: True}
+
+
+@pytest.mark.parametrize("value,expected", [("так", True), ("TRUE", True), ("✅", True), ("x", True),
+                                            ("", False), ("FALSE", False), ("ні", False)])
+def test_flag_values(writer, value, expected):
+    w, ss = writer
+    w.check_connection()
+    ss.tabs[CLIENTS_TAB].rows.append(["200", "Оля", "", "", "", "", "", "", "", value])
+    assert w.read_not_client_flags() == {200: expected}
+
+
+def test_tasks_upsert_by_date_and_chat(writer):
+    w, ss = writer
+    w.queue_upsert(TASKS_TAB, ["06.11.2026", "Іван", "", "100", "", "40", ""])
+    w.queue_upsert(TASKS_TAB, ["06.11.2026", "Оля", "", "200", "", "30", ""])
+    w.flush()
+    w.queue_upsert(TASKS_TAB, ["06.11.2026", "Іван", "", "100", "", "40", "06.11.2026 10:00"])
+    w.queue_upsert(TASKS_TAB, ["07.11.2026", "Оля", "", "200", "", "31", ""])
+    w.flush()
+    rows = ss.tabs[TASKS_TAB].rows
+    assert len(rows) == 4
+    assert rows[1][6] == "06.11.2026 10:00"

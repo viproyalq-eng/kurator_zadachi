@@ -13,13 +13,17 @@ T0 = datetime(2026, 11, 5, 8, 0, tzinfo=timezone.utc)
 
 class FakeSheets:
     def __init__(self):
-        self.messages, self.clients = [], {}
+        self.messages, self.clients, self.new_clients, self.tasks = [], {}, {}, {}
 
     def queue_message(self, row):
         self.messages.append(row)
 
-    def queue_client(self, chat_id, row):
+    def queue_client(self, chat_id, row, new_row=None):
         self.clients[chat_id] = row
+        self.new_clients[chat_id] = new_row or row
+
+    def queue_upsert(self, tab, row, new_row=None):
+        self.tasks[(row[0], row[3])] = row
 
 
 class Env:

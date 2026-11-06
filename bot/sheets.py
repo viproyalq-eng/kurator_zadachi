@@ -28,11 +28,11 @@ TASKS_TAB = "Задачі"
 MESSAGES_HEADER = ["Дата", "Клієнт", "Username", "ID чату", "Хто написав", "Текст"]
 CLIENTS_HEADER = ["ID чату", "Клієнт", "Username", "Тип", "Перший контакт",
                   "Останнє повідомлення", "Хто писав останнім", "Привітання надіслано", "Етап",
-                  "Не клієнт"]
-CLIENTS_BOT_COLUMNS = 9  # A–I бот оновлює; «Не клієнт» (J) — лише при першому додаванні рядка
+                  "Не клієнт", "Статус", "Партнер з"]
 NOT_CLIENT_COLUMN = "Не клієнт"
+NOT_CLIENT_INDEX = CLIENTS_HEADER.index(NOT_CLIENT_COLUMN)  # J — заповнює людина, бот не перезаписує
 TASKS_HEADER = ["Дата задачі", "Клієнт", "Username", "ID чату", "Останній контакт",
-                "Днів без контакту", "Виконано"]
+                "Днів без контакту", "Виконано", "Текст дотику", "Клієнт відповів"]
 
 TRUTHY = {"так", "да", "yes", "y", "1", "x", "х", "+", "true", "✓", "✔", "✅", "v", "не клієнт"}
 
@@ -43,17 +43,66 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 class Tab:
     title: str
     header: list
-    key_cols: tuple   # стовпці, з яких складається «ключ» рядка
-    update_width: int  # скільки перших стовпців бот перезаписує при оновленні
+    key_cols: tuple            # стовпці, з яких складається «ключ» рядка
+    human_cols: tuple = ()     # стовпці, які заповнює людина: при оновленні бот їх не чіпає
+
+    def update_segments(self) -> list[tuple[int, int]]:
+        """Суцільні діапазони стовпців [від, до) для оновлення, без «людських» стовпців."""
+        segments, start = [], None
+        for i in range(len(self.header) + 1):
+            bot_col = i < len(self.header) and i not in self.human_cols
+            if bot_col and start is None:
+                start = i
+            elif not bot_col and start is not None:
+                segments.append((start, i))
+                start = None
+        return segments
 
 
-CLIENTS = Tab(CLIENTS_TAB, CLIENTS_HEADER, (0,), CLIENTS_BOT_COLUMNS)
-TASKS = Tab(TASKS_TAB, TASKS_HEADER, (0, 3), len(TASKS_HEADER))
+CLIENTS = Tab(CLIENTS_TAB, CLIENTS_HEADER, (0,), (NOT_CLIENT_INDEX,))
+TASKS = Tab(TASKS_TAB, TASKS_HEADER, (0, 3))
 UPSERT_TABS = {CLIENTS.title: CLIENTS, TASKS.title: TASKS}
 
 
 def is_truthy(value) -> bool:
     return str(value).strip().lower() in TRUTHY
+
+
+def _api_message(exc: BaseException) -> str:
+    """Дістає текст відповіді Google з помилки (бібліотека часто ховає його всередині)."""
+    for e in (exc, exc.__cause__, exc.__context__):
+        if e is None:
+            continue
+        response = getattr(e, "response", None)
+        if response is not None:
+            try:
+                return str(response.json().get("error", {}).get("message", "")) or str(e)
+            except Exception:  # noqa: BLE001
+                return getattr(response, "text", "") or str(e)
+    return str(exc)
+
+
+def explain_error(exc: BaseException, client_email: str | None) -> str:
+    """Зрозуміле пояснення помилки Google Таблиці для адміна."""
+    name = type(exc).__name__
+    detail = _api_message(exc)
+    low = detail.lower()
+    email = client_email or "email сервісного акаунта (поле client_email у JSON)"
+    if "has not been used" in low or "is disabled" in low or "service_disabled" in low:
+        api = "Google Drive API" if "drive" in low else "Google Sheets API"
+        return (f"У Google Cloud не ввімкнено {api}. Відкрийте console.cloud.google.com → той самий проєкт, "
+                f"що й сервісний акаунт → «APIs & Services» → «Enable APIs» → знайдіть {api} → Enable. "
+                f"Через 2–3 хвилини бот підключиться сам.")
+    if name == "PermissionError" or "permission" in low or "403" in detail:
+        return (f"Немає доступу до таблиці. Відкрийте таблицю → «Поділитися» (Share) → впишіть\n{email}\n"
+                f"→ права «Редактор» → «Надіслати». Бот підключиться сам протягом хвилини.")
+    if name == "SpreadsheetNotFound" or "not found" in low or "404" in detail:
+        return ("Таблицю не знайдено. Перевірте змінну GOOGLE_SHEET_ID: це частина посилання між /d/ і /edit, "
+                "без пробілів і зайвих символів.")
+    if "invalid_grant" in low or "invalid jwt" in low or "private key" in low:
+        return ("Google не приймає ключ сервісного акаунта. Перевірте GOOGLE_CREDENTIALS_JSON: вставлено весь "
+                "JSON без змін; якщо ключ видаляли в Google Cloud — створіть новий.")
+    return f"{name}: {detail}" if detail else name
 
 
 def default_client_factory(credentials: dict):
@@ -130,6 +179,32 @@ class SheetWriter:
         self._worksheet(TASKS_TAB, TASKS_HEADER)
         return self._open().title
 
+    # --- вкладка «Статистика» ---
+    def write_stats(self, grid: list[list]) -> None:
+        """Перезаписує вкладку «Статистика» і (один раз) створює діаграми."""
+        from .stats import STATS_TAB
+        try:
+            ss = self._open()
+            titles = [ws.title for ws in ss.worksheets()]
+            if STATS_TAB in titles:
+                ws = ss.worksheet(STATS_TAB)
+            else:
+                ws = ss.add_worksheet(title=STATS_TAB, rows=max(60, len(grid) + 5), cols=20)
+            ws.update(range_name="A1", values=grid, value_input_option="RAW")
+            self._ensure_charts(ss, ws)
+        except Exception:
+            self._reset()
+            raise
+
+    def _ensure_charts(self, ss, ws) -> None:
+        from .stats import chart_requests, format_requests
+        meta = ss.fetch_sheet_metadata(params={"fields": "sheets(properties(sheetId,title),charts(chartId))"})
+        for sheet in meta.get("sheets", []):
+            if sheet["properties"]["sheetId"] == ws.id:
+                if sheet.get("charts"):
+                    return
+        ss.batch_update({"requests": format_requests(ws.id) + chart_requests(ws.id)})
+
     def _reset(self) -> None:
         self._spreadsheet = None
         self._row_index = {}
@@ -203,12 +278,16 @@ class SheetWriter:
     def _write_upserts(self, tab: Tab, items: dict[str, tuple[list, list]]) -> None:
         ws = self._worksheet(tab.title, tab.header)
         index = self._index(tab, ws)
-        last_col = _col_letter(tab.update_width)
+        segments = tab.update_segments()
         updates, new_rows = [], []
         for key, (row, new_row) in items.items():
             row_no = index.get(key)
             if row_no:
-                updates.append({"range": f"A{row_no}:{last_col}{row_no}", "values": [row[:tab.update_width]]})
+                for start, end in segments:
+                    if start >= len(row):
+                        continue
+                    updates.append({"range": f"{_col_letter(start + 1)}{row_no}:{_col_letter(end)}{row_no}",
+                                    "values": [row[start:end]]})
             else:
                 new_rows.append(new_row)
         if updates:

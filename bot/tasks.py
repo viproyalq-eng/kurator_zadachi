@@ -77,5 +77,7 @@ def task_row(task: Task, tz: ZoneInfo) -> list:
     last = fmt_dt(datetime.fromisoformat(task.last_contact_at), tz) if task.last_contact_at else ""
     days = days_since(task.last_contact_at, datetime.fromisoformat(task.created_at))
     done = fmt_dt(datetime.fromisoformat(task.done_at), tz) if task.done_at else ""
+    replied = fmt_dt(datetime.fromisoformat(task.replied_at), tz) if task.replied_at else ""
+    text = (task.done_text or "")[:500]
     return [fmt_date(task.task_date), task.name or "", f"@{task.username}" if task.username else "",
-            str(task.chat_id), last, "" if days is None else str(days), done]
+            str(task.chat_id), last, "" if days is None else str(days), done, text, replied]

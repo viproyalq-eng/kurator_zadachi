@@ -112,7 +112,7 @@ async def test_commands(app):
 
 
 async def test_handlers_registered(app):
-    assert len(app.application.handlers[0]) == 9
+    assert len(app.application.handlers[0]) == 13
 
 
 async def test_sheet_failure_notifies_once_then_recovers(app):
@@ -255,3 +255,89 @@ async def test_scheduler_runs_once_per_day(app, sent_to, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await app._scheduler_loop()
     assert [c[0] for c in sent_to] == [-1001]   # три «тіки», а надіслано лише раз
+
+
+# --- /partner, кнопки, /stats ---
+
+class Recorder:
+    def __init__(self):
+        self.replies, self.markups, self.answers, self.edits = [], [], [], []
+
+
+def command_update(rec, chat_id, user_id):
+    async def reply(text, reply_markup=None, **kwargs):
+        rec.replies.append(text)
+        rec.markups.append(reply_markup)
+
+    return SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id),
+                           effective_user=SimpleNamespace(id=user_id),
+                           message=SimpleNamespace(reply_text=reply, reply_html=reply))
+
+
+def button_update(rec, data, chat_id, user_id):
+    async def answer(text=None, show_alert=False):
+        rec.answers.append(text)
+
+    async def edit(text, **kwargs):
+        rec.edits.append(text)
+
+    query = SimpleNamespace(data=data, answer=answer, edit_message_text=edit,
+                            from_user=SimpleNamespace(full_name="Віктор"))
+    return SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=chat_id),
+                           effective_user=SimpleNamespace(id=user_id))
+
+
+async def test_partner_flow_in_tasks_group(app):
+    app.cfg.tasks_chat_id = -1001
+    await app.on_business_message(business_update("привіт"), SimpleNamespace())  # клієнт Іван Петренко, id 100
+    rec = Recorder()
+    await app.cmd_partner(command_update(rec, -1001, 555), SimpleNamespace(args=["іван"]))
+    buttons = rec.markups[-1].inline_keyboard
+    assert len(buttons) == 1 and buttons[0][0].callback_data == "partner:100"
+    assert "Іван Петренко @ivan" in buttons[0][0].text
+
+    await app.on_status_button(button_update(rec, "partner:100", -1001, 555), SimpleNamespace())
+    assert "переведено в партнери" in rec.edits[-1] and "Віктор" in rec.edits[-1]
+    assert app.db.get_client(100).status == "партнер"
+    assert app._stats_dirty
+
+    await app.on_status_button(button_update(rec, "partner:100", -1001, 555), SimpleNamespace())
+    assert "вже партнер" in rec.edits[-1]
+
+    await app.cmd_investor(command_update(rec, -1001, 555), SimpleNamespace(args=["@ivan"]))
+    await app.on_status_button(button_update(rec, "investor:100", -1001, 555), SimpleNamespace())
+    assert "повернуто в інвестори" in rec.edits[-1]
+    assert app.db.get_client(100).status == "інвестор"
+
+
+async def test_partner_command_hints_and_permissions(app):
+    app.cfg.tasks_chat_id = -1001
+    rec = Recorder()
+    await app.cmd_partner(command_update(rec, -1001, 555), SimpleNamespace(args=[]))
+    assert "/partner Іван" in rec.replies[-1]
+    await app.cmd_partner(command_update(rec, -1001, 555), SimpleNamespace(args=["нікого"]))
+    assert "Не знайшов" in rec.replies[-1]
+    await app.cmd_partner(command_update(rec, -999, 555), SimpleNamespace(args=["іван"]))  # чужа група
+    assert "працює в групі задач" in rec.replies[-1]
+    await app.on_status_button(button_update(rec, "partner:100", -999, 555), SimpleNamespace())
+    assert app.db.get_client(100) is None or app.db.get_client(100).status == "інвестор"
+    assert "лише в групі задач" in rec.answers[-1]
+
+
+async def test_stats_command(app):
+    rec = Recorder()
+    await app.cmd_stats(command_update(rec, 1, 1), SimpleNamespace(args=[]))
+    assert "Статистика" in rec.replies[-1] and "Робота куратора" in rec.replies[-1]
+
+
+async def test_refresh_stats_writes_grid(app):
+    written = []
+
+    class Sheets:
+        def write_stats(self, grid):
+            written.append(grid)
+
+    app.sheets = Sheets()
+    await app.refresh_stats()
+    assert written and written[0][0][0] == "Статистика куратора"
+    assert not app._stats_dirty

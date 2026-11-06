@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from .config import Config
-from .db import CLIENT_NEW, CLIENT_OLD, Client, Database, Task
+from .db import CLIENT_NEW, CLIENT_OLD, STATUS_INVESTOR, STATUS_PARTNER, Client, Database, Task
 from .logic import SENDER_BOT, SENDER_CLIENT, fmt_dt, is_bonus
 from .sheets import TASKS_TAB
 from .tasks import cutoff_utc, task_row
@@ -97,7 +97,11 @@ class BotService:
 
         if sender == self.cfg.curator_name:
             # Віктор написав клієнту — відкриті задачі по цьому чату виконано.
-            for task in self.db.mark_tasks_done(client.chat_id, msg.date.isoformat()):
+            for task in self.db.mark_tasks_done(client.chat_id, msg.date.isoformat(), msg.text):
+                self._queue_task(task)
+        elif sender == SENDER_CLIENT:
+            # Клієнт відповів після дотику — це ознака, що дотик був справжнім.
+            for task in self.db.mark_tasks_replied(client.chat_id, msg.date.isoformat()):
                 self._queue_task(task)
 
         if wants_welcome:
@@ -153,6 +157,32 @@ class BotService:
                 changed += 1
         return changed
 
+    # --- партнери ---
+    def find_clients(self, query: str, limit: int = 8) -> list[Client]:
+        """Пошук клієнта за частиною імені, @username або ID чату. Свіжіші розмови — першими."""
+        q = query.strip().lstrip("@").casefold()
+        if not q:
+            return []
+        found = []
+        for c in self.db.all_clients():
+            if q.lstrip("-").isdigit() and str(c.chat_id) == q:
+                return [c]
+            if q in (c.name or "").casefold() or q in (c.username or "").casefold():
+                found.append(c)
+        found.sort(key=lambda c: c.last_message_at or "", reverse=True)
+        return found[:limit]
+
+    def set_status(self, chat_id: int, status: str, now_utc: datetime) -> tuple[Client | None, bool]:
+        """Змінює статус. Повертає (клієнт, чи змінився статус)."""
+        before = self.db.get_client(chat_id)
+        if before is None:
+            return None, False
+        if before.status == status:
+            return before, False
+        client = self.db.set_status(chat_id, status, now_utc.isoformat())
+        self._queue_client(client)
+        return client, True
+
     def _queue_task(self, task: Task) -> None:
         if self.sheets:
             self.sheets.queue_upsert(TASKS_TAB, task_row(task, self.cfg.timezone))
@@ -169,17 +199,26 @@ class BotService:
             fmt_dt(date, tz), client.name or "", f"@{client.username}" if client.username else "",
             str(client.chat_id), sender, text,
         ])
-        row = client_row(client, tz)
-        self.sheets.queue_client(client.chat_id, row, row + ["так" if client.excluded else ""])
+        self._queue_client(client)
+
+    def _queue_client(self, client: Client) -> None:
+        if self.sheets:
+            self.sheets.queue_client(client.chat_id, client_row(client, self.cfg.timezone))
 
 
 def _fmt_iso(value: str | None, tz) -> str:
     return fmt_dt(datetime.fromisoformat(value), tz) if value else ""
 
 
+STATUS_LABELS = {STATUS_INVESTOR: "Інвестор", STATUS_PARTNER: "Партнер"}
+
+
 def client_row(client: Client, tz) -> list:
+    """Рядок вкладки «Клієнти». «Не клієнт» записується лише в новий рядок — далі його веде людина."""
     return [
         str(client.chat_id), client.name or "", f"@{client.username}" if client.username else "",
         client.client_type, _fmt_iso(client.first_seen, tz), _fmt_iso(client.last_message_at, tz),
         client.last_from or "", _fmt_iso(client.welcome_sent_at, tz), client.stage or "",
+        "так" if client.excluded else "",
+        STATUS_LABELS.get(client.status, client.status), _fmt_iso(client.partner_since, tz),
     ]

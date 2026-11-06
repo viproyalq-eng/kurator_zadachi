@@ -8,6 +8,9 @@ from dataclasses import dataclass
 CLIENT_NEW = "новий"
 CLIENT_OLD = "старий"
 
+STATUS_INVESTOR = "інвестор"
+STATUS_PARTNER = "партнер"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS business_connections (
     id TEXT PRIMARY KEY,
@@ -29,7 +32,9 @@ CREATE TABLE IF NOT EXISTS clients (
     last_from TEXT,
     welcome_sent_at TEXT,
     stage TEXT,
-    excluded INTEGER NOT NULL DEFAULT 0
+    excluded INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'інвестор',
+    partner_since TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -52,6 +57,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_contact_at TEXT,
     created_at TEXT NOT NULL,
     done_at TEXT,
+    done_text TEXT,
+    replied_at TEXT,
     PRIMARY KEY (task_date, chat_id)
 );
 
@@ -75,6 +82,8 @@ class Client:
     welcome_sent_at: str | None
     stage: str | None
     excluded: int = 0  # 1 = не клієнт (команда, друзі) — не потрапляє в задачі
+    status: str = STATUS_INVESTOR
+    partner_since: str | None = None
 
 
 @dataclass
@@ -85,6 +94,8 @@ class Task:
     last_contact_at: str | None
     created_at: str
     done_at: str | None
+    done_text: str | None = None    # перше повідомлення куратора, яким виконано задачу
+    replied_at: str | None = None   # коли клієнт відповів після дотику
     name: str | None = None
     username: str | None = None
 
@@ -116,6 +127,16 @@ class Database:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(clients)")}
         if "excluded" not in cols:
             self.conn.execute("ALTER TABLE clients ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
+        if "status" not in cols:
+            self.conn.execute(f"ALTER TABLE clients ADD COLUMN status TEXT NOT NULL DEFAULT '{STATUS_INVESTOR}'")
+        if "partner_since" not in cols:
+            self.conn.execute("ALTER TABLE clients ADD COLUMN partner_since TEXT")
+        task_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(tasks)")}
+        if "done_text" not in task_cols:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN done_text TEXT")
+        if "replied_at" not in task_cols:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN replied_at TEXT")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_date ON messages(sender, date)")
 
     def close(self) -> None:
         self.conn.close()
@@ -144,6 +165,7 @@ class Database:
         return Client(**dict(row)) if row else None
 
     def upsert_client(self, client: Client) -> None:
+        # status і partner_since змінюються лише через set_status — тут їх не перезаписуємо.
         self.conn.execute(
             """INSERT INTO clients (chat_id, business_connection_id, name, username, client_type, first_seen,
                                     last_message_at, last_from, welcome_sent_at, stage, excluded)
@@ -154,9 +176,23 @@ class Database:
                  last_message_at=excluded.last_message_at, last_from=excluded.last_from,
                  welcome_sent_at=excluded.welcome_sent_at, stage=excluded.stage,
                  excluded=excluded.excluded""",
-            client.__dict__,
+            {k: v for k, v in client.__dict__.items() if k not in ("status", "partner_since")},
         )
         self.conn.commit()
+
+    def set_status(self, chat_id: int, status: str, now_iso: str) -> Client | None:
+        """Інвестор ↔ партнер. Дата переходу ставиться при переведенні в партнери."""
+        partner_since = now_iso if status == STATUS_PARTNER else None
+        self.conn.execute(
+            """UPDATE clients SET status=?,
+                 partner_since=CASE WHEN ?='партнер' THEN COALESCE(partner_since, ?) ELSE NULL END
+               WHERE chat_id=?""", (status, status, partner_since, chat_id))
+        self.conn.commit()
+        return self.get_client(chat_id)
+
+    def all_clients(self, include_excluded: bool = False) -> list[Client]:
+        sql = "SELECT * FROM clients" + ("" if include_excluded else " WHERE excluded=0")
+        return [Client(**dict(r)) for r in self.conn.execute(sql)]
 
     # --- повідомлення ---
     def add_message(self, chat_id: int, message_id: int, connection_id: str | None,
@@ -211,15 +247,42 @@ class Database:
     def has_tasks(self, task_date: str) -> bool:
         return self.conn.execute("SELECT 1 FROM tasks WHERE task_date=? LIMIT 1", (task_date,)).fetchone() is not None
 
-    def mark_tasks_done(self, chat_id: int, done_iso: str) -> list[Task]:
+    def mark_tasks_done(self, chat_id: int, done_iso: str, text: str | None = None) -> list[Task]:
         """Позначає виконаними всі відкриті задачі по цьому чату. Повертає їх."""
         dates = [r[0] for r in self.conn.execute(
             "SELECT task_date FROM tasks WHERE chat_id=? AND done_at IS NULL", (chat_id,))]
         if not dates:
             return []
-        self.conn.execute("UPDATE tasks SET done_at=? WHERE chat_id=? AND done_at IS NULL", (done_iso, chat_id))
+        self.conn.execute("UPDATE tasks SET done_at=?, done_text=? WHERE chat_id=? AND done_at IS NULL",
+                          (done_iso, text, chat_id))
         self.conn.commit()
         return [t for d in dates for t in self.tasks_for(d) if t.chat_id == chat_id]
+
+    def mark_tasks_replied(self, chat_id: int, reply_iso: str) -> list[Task]:
+        """Клієнт відповів після дотику — позначаємо виконані задачі без відповіді."""
+        dates = [r[0] for r in self.conn.execute(
+            """SELECT task_date FROM tasks WHERE chat_id=? AND done_at IS NOT NULL AND replied_at IS NULL
+               AND done_at <= ?""", (chat_id, reply_iso))]
+        if not dates:
+            return []
+        self.conn.execute(
+            """UPDATE tasks SET replied_at=? WHERE chat_id=? AND done_at IS NOT NULL AND replied_at IS NULL
+               AND done_at <= ?""", (reply_iso, chat_id, reply_iso))
+        self.conn.commit()
+        return [t for d in dates for t in self.tasks_for(d) if t.chat_id == chat_id]
+
+    def all_tasks(self) -> list[Task]:
+        return [Task(**dict(r)) for r in self.conn.execute("SELECT * FROM tasks")]
+
+    def curator_messages(self, sender: str, since_iso: str | None) -> list[tuple[int, str]]:
+        """(chat_id, date) повідомлень куратора в чатах клієнтів (без «не клієнтів»)."""
+        sql = """SELECT m.chat_id, m.date FROM messages m JOIN clients c ON c.chat_id = m.chat_id
+                 WHERE m.sender=? AND c.excluded=0"""
+        params: list = [sender]
+        if since_iso:
+            sql += " AND m.date >= ?"
+            params.append(since_iso)
+        return [(r[0], r[1]) for r in self.conn.execute(sql, params)]
 
     # --- службові налаштування ---
     def get_setting(self, key: str) -> str | None:
@@ -240,4 +303,5 @@ class Database:
             "messages": q("SELECT COUNT(*) FROM messages"),
             "welcomes": q("SELECT COUNT(*) FROM clients WHERE welcome_sent_at IS NOT NULL"),
             "excluded": q("SELECT COUNT(*) FROM clients WHERE excluded=1"),
+            "partners": q(f"SELECT COUNT(*) FROM clients WHERE excluded=0 AND status='{STATUS_PARTNER}'"),
         }

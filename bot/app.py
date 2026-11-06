@@ -6,19 +6,21 @@ import logging
 import traceback
 from datetime import date, datetime, timedelta, timezone
 
-from telegram import BusinessConnection, ChatMember, Message, Update
+from telegram import (BotCommand, BusinessConnection, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup,
+                      Message, Update)
 from telegram.constants import ParseMode
 from telegram.error import ChatMigrated, Conflict, NetworkError, TimedOut
-from telegram.ext import (Application, BusinessConnectionHandler, ChatMemberHandler, CommandHandler,
-                          ContextTypes, MessageHandler, filters)
+from telegram.ext import (Application, BusinessConnectionHandler, CallbackQueryHandler, ChatMemberHandler,
+                          CommandHandler, ContextTypes, MessageHandler, filters)
 
 from .config import Config
-from .db import Connection, Database
+from .db import STATUS_INVESTOR, STATUS_PARTNER, Client, Connection, Database
 from .logic import client_display_name, message_text
 from .notify import Notifier
 from .service import BotService, IncomingMessage
-from .sheets import SheetWriter
-from .tasks import LAST_RUN_KEY, format_tasks_message, is_due
+from .sheets import SheetWriter, explain_error
+from .stats import BOT_STARTED_KEY, build_report, report_grid, summary_text
+from .tasks import LAST_RUN_KEY, fmt_date, format_tasks_message, is_due
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +29,32 @@ ERROR_COOLDOWN = 5 * 60
 SCHEDULER_TICK = 30           # як часто перевіряти, чи не пора надсилати задачі (сек)
 FLAGS_SYNC_SECONDS = 10 * 60  # як часто читати позначки «Не клієнт» з таблиці
 TASKS_CHAT_OVERRIDE_KEY = "tasks_chat_id_override"
+STATS_SECONDS = 10 * 60       # як часто оновлювати вкладку «Статистика»
+
+COMMANDS = [
+    BotCommand("tasks", "Задачі на сьогодні"),
+    BotCommand("partner", "Перевести клієнта в партнери: /partner Ім'я"),
+    BotCommand("investor", "Повернути клієнта в інвестори: /investor Ім'я"),
+    BotCommand("stats", "Статистика роботи куратора"),
+    BotCommand("chatid", "ID цього чату"),
+    BotCommand("id", "Ваш Telegram ID"),
+]
+
+STATUS_ACTIONS = {
+    "partner": (STATUS_PARTNER, "🤝", "переведено в партнери"),
+    "investor": (STATUS_INVESTOR, "↩️", "повернуто в інвестори"),
+}
+
+
+def client_button_label(c: Client) -> str:
+    label = c.name or "Без імені"
+    if c.username:
+        label += f" @{c.username}"
+    if c.last_message_at:
+        label += " · " + datetime.fromisoformat(c.last_message_at).strftime("%d.%m.%y")
+    if c.status == STATUS_PARTNER:
+        label = "🤝 " + label
+    return label[:60]
 
 PRIVATE_ONLY = filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE
 
@@ -76,7 +104,14 @@ class BotApp:
                                   send=self._send_as_curator, resolve_owner=self._resolve_owner)
         self._background: list[asyncio.Task] = []
         self._sheets_failing = False
+        self._stats_dirty = True
         self._register()
+
+    def _allowed(self, update: Update) -> bool:
+        """Робочі команди: у групі задач (будь-хто з учасників) або адміни в будь-якому чаті."""
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_id = update.effective_user.id if update.effective_user else None
+        return (chat_id is not None and chat_id == self.tasks_chat_id) or user_id in self.cfg.admin_chat_ids
 
     # --- група «Задачі куратора» ---
     @property
@@ -161,6 +196,7 @@ class BotApp:
 
     async def _scheduler_loop(self) -> None:
         last_flags_sync = 0.0
+        last_stats = 0.0
         loop = asyncio.get_running_loop()
         while True:
             try:
@@ -169,9 +205,15 @@ class BotApp:
                     # Позначаємо одразу, щоб у разі помилки не надсилати список кожні 30 секунд.
                     self.db.set_setting(LAST_RUN_KEY, now_local.date().isoformat())
                     await self.send_daily_tasks()
+                    self._stats_dirty = True
                 elif self.sheets and loop.time() - last_flags_sync > FLAGS_SYNC_SECONDS:
                     last_flags_sync = loop.time()
                     await self._sync_not_client_flags()
+                if self.sheets and (self._stats_dirty or loop.time() - last_stats > STATS_SECONDS):
+                    last_stats = loop.time()
+                    # спершу дописуємо чергу, щоб статистика й інші вкладки збігалися
+                    await self._flush_sheets_once()
+                    await self.refresh_stats()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -205,6 +247,10 @@ class BotApp:
         app.add_handler(CommandHandler("chatid", self.cmd_chatid, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("status", self.cmd_status, filters=PRIVATE_ONLY))
         app.add_handler(CommandHandler("tasks", self.cmd_tasks, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(CommandHandler("partner", self.cmd_partner, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(CommandHandler("investor", self.cmd_investor, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(CommandHandler("stats", self.cmd_stats, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(CallbackQueryHandler(self.on_status_button, pattern=r"^(partner|investor):-?\d+$"))
         app.add_handler(ChatMemberHandler(self.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, self.on_migrate))
         app.add_error_handler(self.on_error)
@@ -256,9 +302,7 @@ class BotApp:
 
     async def cmd_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Показати сьогоднішні задачі з позначками, що вже виконано."""
-        chat_id = update.effective_chat.id
-        user_id = update.effective_user.id if update.effective_user else None
-        if chat_id != self.tasks_chat_id and user_id not in self.cfg.admin_chat_ids:
+        if not self._allowed(update):
             await update.message.reply_text("Ця команда працює в групі задач або для адмінів.")
             return
         await self._sync_not_client_flags()
@@ -268,12 +312,94 @@ class BotApp:
         text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days)
         await update.message.reply_html(text, disable_web_page_preview=True)
 
+    # --- партнери ---
+    async def cmd_partner(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._status_command(update, context, "partner")
+
+    async def cmd_investor(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._status_command(update, context, "investor")
+
+    async def _status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
+        if not self._allowed(update):
+            await update.message.reply_text("Ця команда працює в групі задач або для адмінів.")
+            return
+        query = " ".join(getattr(context, "args", None) or [])
+        if not query:
+            await update.message.reply_text(
+                f"Напишіть ім'я або @username клієнта, наприклад:\n/{action} Іван\n/{action} @ivan")
+            return
+        found = self.service.find_clients(query)
+        if not found:
+            await update.message.reply_text(
+                f"Не знайшов клієнта «{query}». Спробуйте частину імені або @username, "
+                f"як він підписаний у Telegram.")
+            return
+        _, _, verb = STATUS_ACTIONS[action]
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(client_button_label(c), callback_data=f"{action}:{c.chat_id}")] for c in found])
+        await update.message.reply_text(f"Кого {verb.split()[0]}? Натисніть на клієнта:", reply_markup=keyboard)
+
+    async def on_status_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not self._allowed(update):
+            await query.answer("Це можуть робити лише в групі задач або адміни.", show_alert=True)
+            return
+        action, chat_id = query.data.split(":")
+        status, icon, verb = STATUS_ACTIONS[action]
+        client, changed = self.service.set_status(int(chat_id), status, datetime.now(timezone.utc))
+        if client is None:
+            await query.answer("Клієнта не знайдено.", show_alert=True)
+            return
+        who = client.name or "Без імені"
+        if client.username:
+            who += f" (@{client.username})"
+        if not changed:
+            already = ("вже партнер" + (f" з {fmt_date(datetime.fromisoformat(client.partner_since).astimezone(self.cfg.timezone).date())}"
+                                         if client.partner_since else "")) if status == STATUS_PARTNER else "вже інвестор"
+            await query.answer(already)
+            await query.edit_message_text(f"ℹ️ {who} — {already}.")
+            return
+        self._stats_dirty = True
+        await query.answer("Готово")
+        by = query.from_user.full_name if query.from_user else ""
+        today = fmt_date(datetime.now(self.cfg.timezone).date())
+        await query.edit_message_text(f"{icon} {who} — {verb} {today}" + (f" ({by})" if by else "") + ".")
+
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._allowed(update):
+            await update.message.reply_text("Ця команда працює в групі задач або для адмінів.")
+            return
+        report = self._build_report()
+        await update.message.reply_html(summary_text(report))
+        self._stats_dirty = True
+
+    def _build_report(self):
+        since = self.db.get_setting(BOT_STARTED_KEY)
+        return build_report(self.db.all_clients(include_excluded=True), self.db.all_tasks(),
+                            self.db.curator_messages(self.cfg.curator_name, since),
+                            datetime.now(timezone.utc), self.cfg.timezone)
+
+    async def refresh_stats(self) -> None:
+        self._stats_dirty = False
+        if not self.sheets:
+            return
+        grid = report_grid(self._build_report(), self.cfg.timezone)
+        try:
+            await asyncio.to_thread(self.sheets.write_stats, grid)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Не вдалося оновити вкладку «Статистика»")
+            await self.notifier.notify(f"⚠️ Не вдалося оновити вкладку «Статистика».\n{self._explain_sheets(e)}",
+                                       key="stats", cooldown=SHEETS_ERROR_COOLDOWN)
+
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "Привіт! Я бот куратора.\n\n"
             "/id — ваш Telegram ID\n"
             "/chatid — ID цього чату\n"
             "/tasks — задачі на сьогодні\n"
+            "/partner Ім'я — перевести клієнта в партнери\n"
+            "/investor Ім'я — повернути в інвестори\n"
+            "/stats — статистика роботи куратора\n"
             "/status — стан бота (лише для адміна)")
 
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -306,7 +432,7 @@ class BotApp:
         await update.message.reply_text(
             "📊 Стан бота\n"
             f"Клієнтів: {s['clients']} (нових {s['new_clients']}, старих {s['old_clients']}, "
-            f"не клієнтів {s['excluded']})\n"
+            f"не клієнтів {s['excluded']}, партнерів {s['partners']})\n"
             f"Повідомлень у базі: {s['messages']}\n"
             f"Надіслано привітань: {s['welcomes']}\n"
             f"Привітальний текст: {welcome_line}\n"
@@ -340,14 +466,17 @@ class BotApp:
             log.exception("Помилка запису в Google Таблицю")
             self._sheets_failing = True
             await self.notifier.notify(
-                f"⚠️ Не вдається записати в Google Таблицю: {type(e).__name__}: {e}\n"
-                f"Рядки збережені в черзі й будуть дописані, щойно запрацює. "
-                f"Перевірте GOOGLE_SHEET_ID і що таблицю відкрито для email сервісного акаунта (Редактор).",
+                f"⚠️ Не вдається записати в Google Таблицю.\n{self._explain_sheets(e)}\n\n"
+                f"Рядки збережені в черзі й будуть дописані, щойно запрацює.",
                 key="sheets", cooldown=SHEETS_ERROR_COOLDOWN)
             return
         if self._sheets_failing:
             self._sheets_failing = False
             await self.notifier.notify("✅ Запис у Google Таблицю знову працює.")
+
+    def _explain_sheets(self, exc: BaseException) -> str:
+        email = (self.cfg.google_credentials or {}).get("client_email")
+        return explain_error(exc, email)
 
     async def _flush_loop(self) -> None:
         while True:
@@ -355,7 +484,13 @@ class BotApp:
             await self._flush_sheets_once()
 
     async def _post_init(self, application: Application) -> None:
+        if not self.db.get_setting(BOT_STARTED_KEY):
+            self.db.set_setting(BOT_STARTED_KEY, datetime.now(timezone.utc).isoformat())
         me = await application.bot.get_me()
+        try:
+            await application.bot.set_my_commands(COMMANDS)
+        except Exception:  # noqa: BLE001 — меню команд не критичне
+            log.exception("Не вдалося встановити меню команд")
         lines = [f"✅ Бот @{me.username} запущено."]
         tasks_chat = self.tasks_chat_id
         lines.append(f"🗓 Задачі щодня о {self.cfg.tasks_time.strftime('%H:%M')} "
@@ -367,7 +502,7 @@ class BotApp:
             except Exception as e:  # noqa: BLE001
                 log.exception("Не вдалося підключитися до таблиці")
                 self._sheets_failing = True
-                lines.append(f"❌ Таблиця не підключилася: {type(e).__name__}: {e}")
+                lines.append(f"❌ Таблиця не підключилася.\n{self._explain_sheets(e)}")
         for w in self.cfg.warnings:
             lines.append(f"• {w}")
         await self.notifier.notify("\n".join(lines))

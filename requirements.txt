@@ -1,0 +1,4 @@
+python-telegram-bot==22.8
+gspread==6.2.1
+google-auth>=2.30
+tzdata>=2024.1

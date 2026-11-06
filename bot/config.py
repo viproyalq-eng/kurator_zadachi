@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import time
 from zoneinfo import ZoneInfo
 
+from .texts import REMINDER_TEXT as DEFAULT_REMINDER_TEXT
 from .texts import TEAM_USERNAMES as DEFAULT_TEAM_USERNAMES
 from .texts import WELCOME_TEXT as DEFAULT_WELCOME_TEXT
 
@@ -37,6 +38,10 @@ class Config:
     tasks_per_day: int = 20
     tasks_min_days: int = 10
     team_usernames: set[str] = field(default_factory=set)
+    reminder_text: str = ""
+    reminder_delay_minutes: int = 120
+    send_from: time = field(default_factory=lambda: time(7, 0))     # бот пише клієнтам лише з…
+    send_until: time = field(default_factory=lambda: time(20, 30))  # …і до (за TIMEZONE)
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -128,6 +133,23 @@ def load_config(env: dict | None = None) -> Config:
         warnings.append(f"{name} має бути додатним числом, зараз: {raw!r}. Використовую {default}.")
         return default
 
+    def _hhmm(name: str, default: time) -> time:
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            h, m = raw.split(":")
+            return time(int(h), int(m))
+        except ValueError:
+            warnings.append(f"{name} має бути у форматі 07:00, зараз: {raw!r}")
+            return default
+
+    send_from = _hhmm("SEND_FROM", time(7, 0))
+    send_until = _hhmm("SEND_UNTIL", time(20, 30))
+    if send_from >= send_until:
+        warnings.append("SEND_FROM має бути раніше за SEND_UNTIL — використовую 07:00–20:30.")
+        send_from, send_until = time(7, 0), time(20, 30)
+
     team_raw = env.get("EXCLUDED_USERNAMES")
     team_list = team_raw.split(",") if team_raw is not None else DEFAULT_TEAM_USERNAMES
     team = {u.strip().lstrip("@").lower() for u in team_list if u.strip().lstrip("@")}
@@ -147,5 +169,9 @@ def load_config(env: dict | None = None) -> Config:
         tasks_per_day=_int("TASKS_PER_DAY", 20),
         tasks_min_days=_int("TASKS_MIN_DAYS", 10),
         team_usernames=team,
+        reminder_text=_clean_multiline(env.get("REMINDER_TEXT") or "") or DEFAULT_REMINDER_TEXT.strip(),
+        reminder_delay_minutes=_int("REMINDER_DELAY_MINUTES", 120),
+        send_from=send_from,
+        send_until=send_until,
         warnings=warnings,
     )

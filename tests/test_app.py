@@ -62,6 +62,9 @@ def app(tmp_path):
 
     a.notifier._send = admin_send
     a.service.send = send
+    # «зараз» = 10:05 за Києвом того ж дня, що й тестові повідомлення (тести не залежать від годинника)
+    from datetime import datetime as _dt, timezone as _tz
+    a.service._now = lambda: _dt(2026, 11, 6, 8, 5, tzinfo=_tz.utc)
     return a
 
 

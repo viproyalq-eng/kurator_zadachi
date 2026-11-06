@@ -37,18 +37,33 @@ def fmt_date(d: str | date) -> str:
     return d.strftime("%d.%m.%Y")
 
 
-def client_link(task: Task) -> str:
-    name = html.escape(task.name or "Без імені")
+def person_link(chat_id: int, name: str | None, username: str | None) -> str:
     # tg://user?id= відкриває чат з людиною у Віктора (він з нею вже листувався).
-    link = f'<a href="tg://user?id={task.chat_id}">{name}</a>'
-    if task.username:
-        link += f" (@{html.escape(task.username)})"
+    link = f'<a href="tg://user?id={chat_id}">{html.escape(name or "Без імені")}</a>'
+    if username:
+        link += f" (@{html.escape(username)})"
     return link
+
+
+def client_link(task: Task) -> str:
+    return person_link(task.chat_id, task.name, task.username)
+
+
+TASK_SECTIONS = [
+    ("missed", "🔔 <b>Бот не встиг написати — зробіть касання</b>"),
+    ("no_reply", "📭 <b>Мовчать після привітання і нагадування</b>"),
+    ("stale", "🕰 <b>Давно не було діалогу</b> (найстаріші — першими)"),
+]
+TASK_KIND_LABELS = {
+    "missed": "Бот не встиг написати",
+    "no_reply": "Мовчить після нагадування",
+    "stale": "Давно не спілкувалися",
+}
 
 
 def format_tasks_message(task_date: str, tasks: list[Task], now_utc: datetime, min_days: int,
                          yesterday: tuple[int, int] | None = None, header: str | None = None) -> str:
-    """Текст для групи «Задачі куратора» (HTML)."""
+    """Текст для групи «Задачі куратора» (HTML), розбитий на розділи за типом задачі."""
     lines = [header or f"☀️ <b>Задачі на {fmt_date(task_date)}</b>"]
     if yesterday and yesterday[1]:
         lines.append(f"Вчора виконано: {yesterday[0]} з {yesterday[1]}")
@@ -56,15 +71,23 @@ def format_tasks_message(task_date: str, tasks: list[Task], now_utc: datetime, m
     if not tasks:
         lines.append(f"Сьогодні немає клієнтів, з якими не спілкувалися {min_days}+ днів 🎉")
         return "\n".join(lines)
+    number = 0
+    for kind, title in TASK_SECTIONS:
+        section = [t for t in tasks if (t.kind or "stale") == kind]
+        if not section:
+            continue
+        lines.append(f"{title} — {len(section)}")
+        for t in section:
+            number += 1
+            mark = "✅ " if t.done_at else ""
+            if kind == "stale":
+                d = days_since(t.last_contact_at, now_utc)
+                detail = f"{d} дн. тому" if d is not None else "давно"
+            else:
+                detail = t.note or ""
+            lines.append(f"{number}. {mark}{client_link(t)}" + (f" — {detail}" if detail else ""))
+        lines.append("")
     done = sum(1 for t in tasks if t.done_at)
-    lines.append(f"Написати клієнтам, з якими давно не було діалогу ({len(tasks)}), "
-                 f"найстаріші — першими:")
-    for i, t in enumerate(tasks, start=1):
-        d = days_since(t.last_contact_at, now_utc)
-        when = f"{d} дн. тому" if d is not None else "давно"
-        mark = "✅ " if t.done_at else ""
-        lines.append(f"{i}. {mark}{client_link(t)} — {when}")
-    lines.append("")
     if done:
         lines.append(f"Виконано: {done} з {len(tasks)}")
     lines.append("Задача виконана, щойно Віктор напише клієнту будь-яке повідомлення.")
@@ -80,4 +103,5 @@ def task_row(task: Task, tz: ZoneInfo) -> list:
     replied = fmt_dt(datetime.fromisoformat(task.replied_at), tz) if task.replied_at else ""
     text = (task.done_text or "")[:500]
     return [fmt_date(task.task_date), task.name or "", f"@{task.username}" if task.username else "",
-            str(task.chat_id), last, "" if days is None else str(days), done, text, replied]
+            str(task.chat_id), last, "" if days is None else str(days), done, text, replied,
+            TASK_KIND_LABELS.get(task.kind or "stale", task.kind)]

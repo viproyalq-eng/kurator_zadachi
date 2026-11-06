@@ -53,6 +53,7 @@ class Env:
             return OWNER
 
         self.service = BotService(self.cfg, self.db, self.sheets, Notifier(1, admin_send), send, resolve)
+        self.service._now = lambda: T0 + timedelta(minutes=1)   # 10:01 за Києвом — робочий час
 
     async def msg(self, text, *, chat_id=100, message_id=1, from_user=100, by_bot=False, username="ivan"):
         await self.service.handle_message(IncomingMessage(

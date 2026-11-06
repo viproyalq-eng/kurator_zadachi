@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS clients (
     stage TEXT,
     excluded INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'інвестор',
-    partner_since TEXT
+    partner_since TEXT,
+    welcome_replied_at TEXT,
+    reminder_sent_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -59,8 +61,25 @@ CREATE TABLE IF NOT EXISTS tasks (
     done_at TEXT,
     done_text TEXT,
     replied_at TEXT,
+    kind TEXT NOT NULL DEFAULT 'stale',
+    note TEXT,
     PRIMARY KEY (task_date, chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    business_connection_id TEXT,
+    kind TEXT NOT NULL,            -- welcome | reminder
+    due_at TEXT NOT NULL,          -- коли надіслати (UTC)
+    deadline_at TEXT NOT NULL,     -- до коли Telegram дозволяє написати (24 год після клієнта)
+    status TEXT NOT NULL,          -- pending | sent | cancelled | missed | tasked
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sched_status ON scheduled_messages(status, due_at);
 
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -84,6 +103,8 @@ class Client:
     excluded: int = 0  # 1 = не клієнт (команда, друзі) — не потрапляє в задачі
     status: str = STATUS_INVESTOR
     partner_since: str | None = None
+    welcome_replied_at: str | None = None   # клієнт відповів після привітання
+    reminder_sent_at: str | None = None     # бот надіслав нагадування
 
 
 @dataclass
@@ -96,8 +117,24 @@ class Task:
     done_at: str | None
     done_text: str | None = None    # перше повідомлення куратора, яким виконано задачу
     replied_at: str | None = None   # коли клієнт відповів після дотику
+    kind: str = "stale"             # stale — давно не спілкувалися; missed; no_reply
+    note: str | None = None
     name: str | None = None
     username: str | None = None
+
+
+@dataclass
+class Scheduled:
+    id: int
+    chat_id: int
+    business_connection_id: str | None
+    kind: str
+    due_at: str
+    deadline_at: str
+    status: str
+    created_at: str
+    sent_at: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -129,13 +166,18 @@ class Database:
             self.conn.execute("ALTER TABLE clients ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
         if "status" not in cols:
             self.conn.execute(f"ALTER TABLE clients ADD COLUMN status TEXT NOT NULL DEFAULT '{STATUS_INVESTOR}'")
-        if "partner_since" not in cols:
-            self.conn.execute("ALTER TABLE clients ADD COLUMN partner_since TEXT")
+        for col in ("partner_since", "welcome_replied_at", "reminder_sent_at"):
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE clients ADD COLUMN {col} TEXT")
         task_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(tasks)")}
         if "done_text" not in task_cols:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN done_text TEXT")
         if "replied_at" not in task_cols:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN replied_at TEXT")
+        if "kind" not in task_cols:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'stale'")
+        if "note" not in task_cols:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN note TEXT")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_date ON messages(sender, date)")
 
     def close(self) -> None:
@@ -168,14 +210,17 @@ class Database:
         # status і partner_since змінюються лише через set_status — тут їх не перезаписуємо.
         self.conn.execute(
             """INSERT INTO clients (chat_id, business_connection_id, name, username, client_type, first_seen,
-                                    last_message_at, last_from, welcome_sent_at, stage, excluded)
+                                    last_message_at, last_from, welcome_sent_at, stage, excluded,
+                                    welcome_replied_at, reminder_sent_at)
                VALUES (:chat_id, :business_connection_id, :name, :username, :client_type, :first_seen,
-                       :last_message_at, :last_from, :welcome_sent_at, :stage, :excluded)
+                       :last_message_at, :last_from, :welcome_sent_at, :stage, :excluded,
+                       :welcome_replied_at, :reminder_sent_at)
                ON CONFLICT(chat_id) DO UPDATE SET business_connection_id=excluded.business_connection_id,
                  name=excluded.name, username=excluded.username, client_type=excluded.client_type,
                  last_message_at=excluded.last_message_at, last_from=excluded.last_from,
                  welcome_sent_at=excluded.welcome_sent_at, stage=excluded.stage,
-                 excluded=excluded.excluded""",
+                 excluded=excluded.excluded, welcome_replied_at=excluded.welcome_replied_at,
+                 reminder_sent_at=excluded.reminder_sent_at""",
             {k: v for k, v in client.__dict__.items() if k not in ("status", "partner_since")},
         )
         self.conn.commit()
@@ -230,12 +275,85 @@ class Database:
                ORDER BY last_message_at ASC LIMIT ?""", (cutoff_iso, limit)).fetchall()
         return [Client(**dict(r)) for r in rows]
 
-    def create_tasks(self, task_date: str, clients: list[Client], now_iso: str) -> None:
-        for pos, c in enumerate(clients, start=1):
+    def create_tasks(self, task_date: str, clients: list[Client], now_iso: str,
+                     kind: str = "stale", notes: dict[int, str] | None = None) -> None:
+        start = self.conn.execute("SELECT COALESCE(MAX(position), 0) FROM tasks WHERE task_date=?",
+                                  (task_date,)).fetchone()[0]
+        for pos, c in enumerate(clients, start=start + 1):
             self.conn.execute(
-                """INSERT OR IGNORE INTO tasks (task_date, chat_id, position, last_contact_at, created_at)
-                   VALUES (?, ?, ?, ?, ?)""", (task_date, c.chat_id, pos, c.last_message_at, now_iso))
+                """INSERT OR IGNORE INTO tasks (task_date, chat_id, position, last_contact_at, created_at, kind, note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (task_date, c.chat_id, pos, c.last_message_at, now_iso, kind, (notes or {}).get(c.chat_id)))
         self.conn.commit()
+
+    def has_task_kind(self, chat_id: int, kind: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM tasks WHERE chat_id=? AND kind=? LIMIT 1",
+                                 (chat_id, kind)).fetchone() is not None
+
+    # --- заплановані повідомлення клієнтам ---
+    def schedule_message(self, chat_id: int, connection_id: str | None, kind: str, due_iso: str,
+                         deadline_iso: str, now_iso: str, status: str = "pending") -> int:
+        """Нове заплановане повідомлення; попереднє незавершене такого ж типу скасовується."""
+        self.conn.execute("UPDATE scheduled_messages SET status='cancelled' "
+                          "WHERE chat_id=? AND kind=? AND status='pending'", (chat_id, kind))
+        cur = self.conn.execute(
+            """INSERT INTO scheduled_messages (chat_id, business_connection_id, kind, due_at, deadline_at,
+                                               status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (chat_id, connection_id, kind, due_iso, deadline_iso, status, now_iso))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def scheduled(self, chat_id: int | None = None, status: str | None = None) -> list[Scheduled]:
+        sql, params = "SELECT * FROM scheduled_messages WHERE 1=1", []
+        if chat_id is not None:
+            sql += " AND chat_id=?"
+            params.append(chat_id)
+        if status is not None:
+            sql += " AND status=?"
+            params.append(status)
+        return [Scheduled(**dict(r)) for r in self.conn.execute(sql + " ORDER BY id", params)]
+
+    def due_messages(self, now_iso: str) -> list[Scheduled]:
+        rows = self.conn.execute("SELECT * FROM scheduled_messages WHERE status='pending' AND due_at <= ? "
+                                 "ORDER BY due_at", (now_iso,))
+        return [Scheduled(**dict(r)) for r in rows]
+
+    def update_scheduled(self, sched_id: int, *, status: str, due_iso: str | None = None,
+                         sent_iso: str | None = None, error: str | None = None) -> None:
+        self.conn.execute(
+            """UPDATE scheduled_messages SET status=?, due_at=COALESCE(?, due_at), sent_at=COALESCE(?, sent_at),
+                 error=COALESCE(?, error) WHERE id=?""", (status, due_iso, sent_iso, error, sched_id))
+        self.conn.commit()
+
+    def cancel_scheduled(self, chat_id: int, kinds: tuple[str, ...]) -> int:
+        marks = ",".join("?" for _ in kinds)
+        cur = self.conn.execute(
+            f"UPDATE scheduled_messages SET status='cancelled' WHERE chat_id=? AND status='pending' "
+            f"AND kind IN ({marks})", (chat_id, *kinds))
+        self.conn.commit()
+        return cur.rowcount
+
+    def extend_deadlines(self, chat_id: int, deadline_iso: str) -> None:
+        """Клієнт написав ще — Telegram знову дає 24 години."""
+        self.conn.execute("UPDATE scheduled_messages SET deadline_at=? WHERE chat_id=? AND status='pending' "
+                          "AND deadline_at < ?", (deadline_iso, chat_id, deadline_iso))
+        self.conn.commit()
+
+    def last_client_message_at(self, chat_id: int, client_sender: str) -> str | None:
+        row = self.conn.execute("SELECT MAX(date) FROM messages WHERE chat_id=? AND sender=?",
+                                (chat_id, client_sender)).fetchone()
+        return row[0] if row else None
+
+    def curator_wrote_after(self, chat_id: int, curator_sender: str, after_iso: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM messages WHERE chat_id=? AND sender=? AND date > ? LIMIT 1",
+                                 (chat_id, curator_sender, after_iso)).fetchone() is not None
+
+    def silent_after_reminder(self, sent_before_iso: str) -> list[Client]:
+        """Клієнти, яким надіслано нагадування (до вказаного часу), але вони так і не відповіли."""
+        rows = self.conn.execute(
+            """SELECT * FROM clients WHERE excluded=0 AND reminder_sent_at IS NOT NULL
+               AND reminder_sent_at < ? AND welcome_replied_at IS NULL""", (sent_before_iso,))
+        return [Client(**dict(r)) for r in rows]
 
     def tasks_for(self, task_date: str) -> list[Task]:
         rows = self.conn.execute(

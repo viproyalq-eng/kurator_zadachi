@@ -103,7 +103,8 @@ class BotApp:
 
         self.notifier = Notifier(cfg.admin_chat_ids, send_admin)
         self.service = BotService(cfg, self.db, self.sheets, self.notifier,
-                                  send=self._send_as_curator, resolve_owner=self._resolve_owner)
+                                  send=self._send_as_curator, resolve_owner=self._resolve_owner,
+                                  notify_group=self.send_to_tasks_chat)
         self._background: list[asyncio.Task] = []
         self._sheets_failing = False
         self._stats_dirty = True
@@ -204,6 +205,8 @@ class BotApp:
         loop = asyncio.get_running_loop()
         while True:
             try:
+                # Привітання й нагадування, яким настав час (лише в робочі години).
+                await self.service.process_scheduled()
                 now_local = datetime.now(self.cfg.timezone)
                 if is_due(now_local, self.cfg.tasks_time, self.db.get_setting(LAST_RUN_KEY)):
                     # Позначаємо одразу, щоб у разі помилки не надсилати список кожні 30 секунд.
@@ -481,7 +484,8 @@ class BotApp:
             f"Таблиця: {sheet_line}\n"
             f"Задачі: щодня о {self.cfg.tasks_time.strftime('%H:%M')} ({self.cfg.tasks_per_day} шт., "
             f"без контакту {self.cfg.tasks_min_days}+ днів), {tasks_line}\n"
-            f"Сьогодні виконано: {done} з {len(today_tasks)}")
+            f"Сьогодні виконано: {done} з {len(today_tasks)}\n"
+            f"Заплановано повідомлень клієнтам: {len(self.db.scheduled(status='pending'))}")
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         err = context.error
@@ -535,6 +539,9 @@ class BotApp:
             log.exception("Не вдалося встановити меню команд")
         lines = [f"✅ Бот @{me.username} запущено."]
         tasks_chat = self.tasks_chat_id
+        lines.append(f"🕖 Пише клієнтам з {self.cfg.send_from.strftime('%H:%M')} до "
+                     f"{self.cfg.send_until.strftime('%H:%M')}; нагадування через "
+                     f"{self.cfg.reminder_delay_minutes} хв без відповіді.")
         lines.append(f"🗓 Задачі щодня о {self.cfg.tasks_time.strftime('%H:%M')} "
                      + (f"у групу {tasks_chat}." if tasks_chat else "— група ще не задана, надсилатиму вам."))
         if self.sheets:

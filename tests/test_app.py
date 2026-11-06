@@ -46,7 +46,7 @@ def test_connection_from_tg():
 
 @pytest.fixture
 def app(tmp_path):
-    cfg = load_config({"BOT_TOKEN": "123:ABC", "ADMIN_CHAT_ID": "1",
+    cfg = load_config({"BOT_TOKEN": "123:ABC", "ADMIN_CHAT_ID": "1, 2",
                        "DB_PATH": str(tmp_path / "data" / "bot.db"), "WELCOME_TEXT": "Вітаю!"})
     a = BotApp(cfg)
     a.admin = []
@@ -104,7 +104,7 @@ async def test_commands(app):
     await app.cmd_id(upd, None)
     await app.cmd_chatid(upd, None)
     await app.cmd_status(upd, None)  # не адмін
-    upd.effective_chat.id = 1
+    upd.effective_chat.id = 2  # другий адмін теж має доступ
     await app.cmd_status(upd, None)
     assert "42" in replies[0] and "-100500" in replies[1]
     assert "лише для адміна" in replies[2]
@@ -126,7 +126,7 @@ async def test_sheet_failure_notifies_once_then_recovers(app):
     app.sheets = Flaky()
     await app._flush_sheets_once()
     await app._flush_sheets_once()
-    assert sum("Google Таблицю" in m for m in app.admin) == 1
+    assert sum("Google Таблицю" in m for m in app.admin) == 2  # один раз кожному з 2 адмінів
     app.sheets.fail = False
     await app._flush_sheets_once()
     assert "знову працює" in app.admin[-1]

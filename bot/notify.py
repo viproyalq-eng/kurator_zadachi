@@ -11,15 +11,20 @@ MAX_LEN = 3500
 
 
 class Notifier:
-    def __init__(self, admin_chat_id: int | None, send: Callable[[int, str], Awaitable[None]] | None,
+    def __init__(self, admin_chat_ids: list[int] | int | None,
+                 send: Callable[[int, str], Awaitable[None]] | None,
                  clock: Callable[[], float] = time.monotonic):
-        self.admin_chat_id = admin_chat_id
+        if admin_chat_ids is None:
+            admin_chat_ids = []
+        elif isinstance(admin_chat_ids, int):
+            admin_chat_ids = [admin_chat_ids]
+        self.admin_chat_ids = list(admin_chat_ids)
         self._send = send
         self._clock = clock
         self._last_sent: dict[str, float] = {}
 
     async def notify(self, text: str, *, key: str | None = None, cooldown: float = 0) -> bool:
-        """Надсилає повідомлення адміну. Якщо задано key — не частіше, ніж раз на cooldown секунд."""
+        """Надсилає повідомлення всім адмінам. Якщо задано key — не частіше, ніж раз на cooldown секунд."""
         log.info("ADMIN: %s", text)
         if key and cooldown:
             now = self._clock()
@@ -27,13 +32,16 @@ class Notifier:
             if last is not None and now - last < cooldown:
                 return False
             self._last_sent[key] = now
-        if not self.admin_chat_id or not self._send:
+        if not self.admin_chat_ids or not self._send:
             return False
         if len(text) > MAX_LEN:
             text = text[:MAX_LEN] + "…"
-        try:
-            await self._send(self.admin_chat_id, text)
-            return True
-        except Exception:  # noqa: BLE001 — сповіщення не має ламати бота
-            log.exception("Не вдалося надіслати сповіщення адміну")
-            return False
+        delivered = False
+        for chat_id in self.admin_chat_ids:
+            try:
+                await self._send(chat_id, text)
+                delivered = True
+            except Exception:  # noqa: BLE001 — сповіщення не має ламати бота
+                # Найчастіше: адмін ще не натиснув «Старт» у боті.
+                log.exception("Не вдалося надіслати сповіщення адміну %s", chat_id)
+        return delivered

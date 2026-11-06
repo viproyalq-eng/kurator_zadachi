@@ -66,7 +66,7 @@ class BotApp:
         async def send_admin(chat_id: int, text: str) -> None:
             await bot.send_message(chat_id=chat_id, text=text)
 
-        self.notifier = Notifier(cfg.admin_chat_id, send_admin)
+        self.notifier = Notifier(cfg.admin_chat_ids, send_admin)
         self.service = BotService(cfg, self.db, self.sheets, self.notifier,
                                   send=self._send_as_curator, resolve_owner=self._resolve_owner)
         self._flush_task: asyncio.Task | None = None
@@ -132,10 +132,10 @@ class BotApp:
         await update.message.reply_html(f"ID цього чату: <code>{chat.id}</code>")
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self.cfg.admin_chat_id:
+        if not self.cfg.admin_chat_ids:
             await update.message.reply_text("Спочатку додайте змінну ADMIN_CHAT_ID у Railway (ваш ID із команди /id).")
             return
-        if update.effective_chat.id != self.cfg.admin_chat_id:
+        if update.effective_chat.id not in self.cfg.admin_chat_ids:
             await update.message.reply_text("Ця команда лише для адміна.")
             return
         s = self.db.stats()

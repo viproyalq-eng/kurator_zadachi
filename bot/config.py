@@ -22,7 +22,7 @@ def _clean_multiline(value: str) -> str:
 class Config:
     bot_token: str
     db_path: str = "bot.db"
-    admin_chat_id: int | None = None
+    admin_chat_ids: list[int] = field(default_factory=list)
     google_sheet_id: str | None = None
     google_credentials: dict | None = None
     welcome_text: str = ""
@@ -46,13 +46,19 @@ def load_config(env: dict | None = None) -> Config:
 
     warnings: list[str] = []
 
-    admin_raw = (env.get("ADMIN_CHAT_ID") or "").strip()
-    admin_chat_id = None
-    if admin_raw:
+    # Кілька адмінів — через кому: 123456789, 987654321
+    admin_chat_ids: list[int] = []
+    for part in (env.get("ADMIN_CHAT_ID") or "").replace(";", ",").replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
         try:
-            admin_chat_id = int(admin_raw)
+            value = int(part)
         except ValueError:
-            warnings.append(f"ADMIN_CHAT_ID має бути числом, зараз: {admin_raw!r}")
+            warnings.append(f"ADMIN_CHAT_ID: «{part}» не схоже на ID (має бути число), пропускаю.")
+            continue
+        if value not in admin_chat_ids:
+            admin_chat_ids.append(value)
 
     sheet_id = (env.get("GOOGLE_SHEET_ID") or "").strip() or None
     creds_raw = (env.get("GOOGLE_CREDENTIALS_JSON") or "").strip()
@@ -86,7 +92,7 @@ def load_config(env: dict | None = None) -> Config:
     return Config(
         bot_token=token,
         db_path=(env.get("DB_PATH") or "bot.db").strip(),
-        admin_chat_id=admin_chat_id,
+        admin_chat_ids=admin_chat_ids,
         google_sheet_id=sheet_id,
         google_credentials=creds,
         welcome_text=welcome,

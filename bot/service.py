@@ -55,6 +55,19 @@ SendFn = Callable[[str, int, str], Awaitable[tuple[int, datetime]]]
 OwnerFn = Callable[[str], Awaitable[int | None]]
 
 
+@dataclass
+class ImportReport:
+    chats: int = 0
+    new_clients: int = 0
+    updated_clients: int = 0
+    messages: int = 0
+    skipped_groups: int = 0
+    skipped_bots: int = 0
+    skipped_other: int = 0
+    oldest_contact: str | None = None
+    ready_for_tasks: int = 0
+
+
 class BotService:
     def __init__(self, cfg: Config, db: Database, sheets, notifier: Notifier,
                  send: SendFn, resolve_owner: OwnerFn,
@@ -307,6 +320,47 @@ class BotService:
             if self.db.set_excluded(chat_id, excluded):
                 changed += 1
         return changed
+
+    # --- імпорт старих чатів ---
+    def import_export(self, export, before: datetime | None, now: datetime) -> "ImportReport":
+        """Заносить чати з експорту Telegram у базу і таблицю.
+        Повідомлення, новіші за запуск бота (before), пропускаємо — їх бот уже записав сам."""
+        report = ImportReport(skipped_groups=export.skipped_groups, skipped_bots=export.skipped_bots,
+                              skipped_other=export.skipped_other)
+        self.db.exclude_usernames(self.cfg.team_usernames)
+        for chat in export.chats:
+            msgs = [m for m in chat.messages if before is None or m.date < before]
+            if not msgs:
+                continue
+            msgs.sort(key=lambda m: m.date)
+            rows = [(chat.chat_id, m.message_id, None, self.cfg.curator_name if m.from_owner else SENDER_CLIENT,
+                     m.text, m.date.isoformat()) for m in msgs]
+            report.messages += self.db.add_messages_bulk(rows)
+            first, last = msgs[0], msgs[-1]
+            last_from = self.cfg.curator_name if last.from_owner else SENDER_CLIENT
+            client = self.db.get_client(chat.chat_id)
+            if client is None:
+                client = Client(chat_id=chat.chat_id, business_connection_id=None, name=chat.name, username=None,
+                                client_type=CLIENT_OLD, first_seen=first.date.isoformat(),
+                                last_message_at=last.date.isoformat(), last_from=last_from,
+                                welcome_sent_at=None, stage=None)
+                report.new_clients += 1
+            else:
+                client.name = client.name or chat.name
+                if first.date.isoformat() < client.first_seen:
+                    client.first_seen = first.date.isoformat()
+                if not client.last_message_at or last.date.isoformat() > client.last_message_at:
+                    client.last_message_at = last.date.isoformat()
+                    client.last_from = last_from
+                report.updated_clients += 1
+            self.db.upsert_client(client)
+            self._queue_client(self.db.get_client(chat.chat_id))
+            report.chats += 1
+            if report.oldest_contact is None or client.last_message_at < report.oldest_contact:
+                report.oldest_contact = client.last_message_at
+        cutoff = cutoff_utc(now, self.cfg.tasks_min_days).isoformat()
+        report.ready_for_tasks = len(self.db.task_candidates(cutoff, 10 ** 9))
+        return report
 
     # --- партнери ---
     def find_clients(self, query: str, limit: int = 8) -> list[Client]:

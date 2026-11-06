@@ -217,6 +217,7 @@ class Database:
                        :welcome_replied_at, :reminder_sent_at)
                ON CONFLICT(chat_id) DO UPDATE SET business_connection_id=excluded.business_connection_id,
                  name=excluded.name, username=excluded.username, client_type=excluded.client_type,
+                 first_seen=MIN(clients.first_seen, excluded.first_seen),
                  last_message_at=excluded.last_message_at, last_from=excluded.last_from,
                  welcome_sent_at=excluded.welcome_sent_at, stage=excluded.stage,
                  excluded=excluded.excluded, welcome_replied_at=excluded.welcome_replied_at,
@@ -411,6 +412,18 @@ class Database:
         self.conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
         self.conn.commit()
+
+    def add_messages_bulk(self, rows: list[tuple]) -> int:
+        """rows: (chat_id, message_id, connection_id, sender, text, date_iso). Повертає, скільки додано нових."""
+        before = self.conn.total_changes
+        self.conn.executemany(
+            """INSERT OR IGNORE INTO messages (chat_id, message_id, business_connection_id, sender, text, date)
+               VALUES (?, ?, ?, ?, ?, ?)""", rows)
+        self.conn.commit()
+        return self.conn.total_changes - before
+
+    def owner_ids(self) -> set[int]:
+        return {r[0] for r in self.conn.execute("SELECT owner_user_id FROM business_connections")}
 
     def stats(self) -> dict:
         q = lambda sql: self.conn.execute(sql).fetchone()[0]

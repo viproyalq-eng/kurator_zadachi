@@ -19,6 +19,7 @@ from .logic import client_display_name, message_text
 from .notify import Notifier
 from .service import BotService, IncomingMessage
 from .sheets import SheetWriter, explain_error
+from .importer import ImportError_, load_bytes, parse_export
 from .stats import BOT_STARTED_KEY, build_report, report_grid, summary_text
 from .tasks import LAST_RUN_KEY, fmt_date, format_tasks_message, is_due
 
@@ -31,6 +32,7 @@ FLAGS_SYNC_SECONDS = 10 * 60  # як часто читати позначки «
 TASKS_CHAT_OVERRIDE_KEY = "tasks_chat_id_override"
 STATS_SECONDS = 10 * 60       # як часто оновлювати вкладку «Статистика»
 ASK_NAME_SECONDS = 10 * 60    # скільки бот чекає на ім'я клієнта після /partner без імені
+MAX_DOWNLOAD_BYTES = 20 * 1000 * 1000  # Telegram дозволяє ботам завантажувати файли до 20 МБ
 CANCEL_WORDS = {"скасувати", "отмена", "відміна", "cancel", "стоп"}
 
 COMMANDS = [
@@ -38,6 +40,7 @@ COMMANDS = [
     BotCommand("partner", "Перевести клієнта в партнери"),
     BotCommand("investor", "Повернути клієнта в інвестори"),
     BotCommand("stats", "Статистика роботи куратора"),
+    BotCommand("import", "Завантажити старі чати (файл експорту Telegram)"),
     BotCommand("chatid", "ID цього чату"),
     BotCommand("id", "Ваш Telegram ID"),
 ]
@@ -257,6 +260,8 @@ class BotApp:
         app.add_handler(CommandHandler("partner", self.cmd_partner, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("investor", self.cmd_investor, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("stats", self.cmd_stats, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(CommandHandler("import", self.cmd_import, filters=PRIVATE_ONLY))
+        app.add_handler(MessageHandler(PRIVATE_ONLY & filters.Document.ALL, self.on_document))
         app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND,
                                        self.on_name_reply))
         app.add_handler(CallbackQueryHandler(self.on_status_button, pattern=r"^(partner|investor):-?\d+$"))
@@ -436,6 +441,78 @@ class BotApp:
             await self.notifier.notify(f"⚠️ Не вдалося оновити вкладку «Статистика».\n{self._explain_sheets(e)}",
                                        key="stats", cooldown=SHEETS_ERROR_COOLDOWN)
 
+    # --- імпорт старих чатів ---
+    def _can_import(self, user_id: int | None) -> bool:
+        return user_id is not None and (user_id in self.cfg.admin_chat_ids or user_id in self.db.owner_ids())
+
+    async def cmd_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._can_import(update.effective_user.id if update.effective_user else None):
+            await update.message.reply_text("Імпорт можуть робити лише адміни або Віктор.")
+            return
+        await update.message.reply_text(
+            "📥 Надішліть сюди файл експорту Telegram:\n"
+            "• result.json (формат JSON, лише «Особисті чати»), або\n"
+            "• zip-архів з ним, якщо файл більший за 20 МБ.\n\n"
+            "Можна надсилати повторно — дублів не буде.")
+
+    async def on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.message
+        doc = message.document
+        user_id = update.effective_user.id if update.effective_user else None
+        name = (doc.file_name or "").lower()
+        if not (name.endswith(".json") or name.endswith(".zip")):
+            if self._can_import(user_id):
+                await message.reply_text("Для імпорту потрібен файл result.json або zip з ним.")
+            return
+        if not self._can_import(user_id):
+            await message.reply_text("Імпорт можуть робити лише адміни або Віктор.")
+            return
+        if doc.file_size and doc.file_size > MAX_DOWNLOAD_BYTES:
+            mb = doc.file_size / 1_000_000
+            await message.reply_text(
+                f"Файл {mb:.0f} МБ, а Telegram дозволяє боту завантажити лише до 20 МБ.\n"
+                f"Стисніть result.json у zip (правою кнопкою → «Стиснути»): JSON зменшується в 5–10 разів.\n"
+                f"Якщо й zip завеликий — зробіть експорт частинами (у налаштуваннях експорту є період «З / До»).")
+            return
+        await message.reply_text("⏳ Отримав файл, завантажую чати… Це може зайняти хвилину.")
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            data = await tg_file.download_as_bytearray()
+            owner = next(iter(self.db.owner_ids()), None)
+            export = await asyncio.to_thread(
+                lambda: parse_export(load_bytes(bytes(data), name), self.cfg.timezone, owner))
+        except ImportError_ as e:
+            await message.reply_text(f"❌ {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            log.exception("Помилка імпорту")
+            await message.reply_text(f"❌ Не вдалося прочитати файл: {type(e).__name__}: {e}")
+            return
+
+        started = self.db.get_setting(BOT_STARTED_KEY)
+        before = datetime.fromisoformat(started) if started else None
+        report = self.service.import_export(export, before, datetime.now(timezone.utc))
+        self._stats_dirty = True
+        oldest = (fmt_date(datetime.fromisoformat(report.oldest_contact).astimezone(self.cfg.timezone).date())
+                  if report.oldest_contact else "—")
+        await message.reply_text(
+            "✅ Імпорт завершено\n"
+            f"Особистих чатів: {report.chats} (нових клієнтів {report.new_clients}, "
+            f"оновлено {report.updated_clients})\n"
+            f"Повідомлень додано: {report.messages}\n"
+            f"Пропущено: груп і каналів {report.skipped_groups}, ботів {report.skipped_bots}, "
+            f"інших {report.skipped_other} (збережене, видалені акаунти, службові, порожні)\n"
+            f"Найдавніший контакт: {oldest}\n"
+            f"Готові до задач ({self.cfg.tasks_min_days}+ днів без контакту): {report.ready_for_tasks} — "
+            f"щоранку по {self.cfg.tasks_per_day}.\n\n"
+            "Далі: відкрийте в таблиці вкладку «Клієнти» і поставте «так» у стовпці «Не клієнт» "
+            "друзям, рідним і колегам — у задачі вони не потраплятимуть.")
+        if export.owner_id is None and owner is None:
+            await message.reply_text(
+                "⚠️ У файлі немає даних акаунта, тому я не точно знаю, які повідомлення писав Віктор. "
+                "Наступного разу залиште в експорті ввімкненим «Інформація про акаунт».")
+        await self._flush_sheets_once()
+
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "Привіт! Я бот куратора.\n\n"
@@ -445,6 +522,7 @@ class BotApp:
             "/partner Ім'я — перевести клієнта в партнери\n"
             "/investor Ім'я — повернути в інвестори\n"
             "/stats — статистика роботи куратора\n"
+            "/import — завантажити старі чати (файл експорту)\n"
             "/status — стан бота (лише для адміна)")
 
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

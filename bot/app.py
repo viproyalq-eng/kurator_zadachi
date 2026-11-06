@@ -6,8 +6,8 @@ import logging
 import traceback
 from datetime import date, datetime, timedelta, timezone
 
-from telegram import (BotCommand, BusinessConnection, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup,
-                      Message, Update)
+from telegram import (BotCommand, BusinessConnection, ChatMember, ForceReply, InlineKeyboardButton,
+                      InlineKeyboardMarkup, Message, Update)
 from telegram.constants import ParseMode
 from telegram.error import ChatMigrated, Conflict, NetworkError, TimedOut
 from telegram.ext import (Application, BusinessConnectionHandler, CallbackQueryHandler, ChatMemberHandler,
@@ -30,11 +30,13 @@ SCHEDULER_TICK = 30           # як часто перевіряти, чи не 
 FLAGS_SYNC_SECONDS = 10 * 60  # як часто читати позначки «Не клієнт» з таблиці
 TASKS_CHAT_OVERRIDE_KEY = "tasks_chat_id_override"
 STATS_SECONDS = 10 * 60       # як часто оновлювати вкладку «Статистика»
+ASK_NAME_SECONDS = 10 * 60    # скільки бот чекає на ім'я клієнта після /partner без імені
+CANCEL_WORDS = {"скасувати", "отмена", "відміна", "cancel", "стоп"}
 
 COMMANDS = [
     BotCommand("tasks", "Задачі на сьогодні"),
-    BotCommand("partner", "Перевести клієнта в партнери: /partner Ім'я"),
-    BotCommand("investor", "Повернути клієнта в інвестори: /investor Ім'я"),
+    BotCommand("partner", "Перевести клієнта в партнери"),
+    BotCommand("investor", "Повернути клієнта в інвестори"),
     BotCommand("stats", "Статистика роботи куратора"),
     BotCommand("chatid", "ID цього чату"),
     BotCommand("id", "Ваш Telegram ID"),
@@ -105,6 +107,8 @@ class BotApp:
         self._background: list[asyncio.Task] = []
         self._sheets_failing = False
         self._stats_dirty = True
+        # (чат, користувач) -> (дія, коли спитали): бот чекає ім'я клієнта після /partner чи /investor
+        self._awaiting_name: dict[tuple[int, int], tuple[str, float]] = {}
         self._register()
 
     def _allowed(self, update: Update) -> bool:
@@ -250,6 +254,8 @@ class BotApp:
         app.add_handler(CommandHandler("partner", self.cmd_partner, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("investor", self.cmd_investor, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("stats", self.cmd_stats, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND,
+                                       self.on_name_reply))
         app.add_handler(CallbackQueryHandler(self.on_status_button, pattern=r"^(partner|investor):-?\d+$"))
         app.add_handler(ChatMemberHandler(self.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, self.on_migrate))
@@ -325,19 +331,55 @@ class BotApp:
             return
         query = " ".join(getattr(context, "args", None) or [])
         if not query:
+            # Команду натиснули з меню без імені — питаємо ім'я і чекаємо відповідь.
+            key = (update.effective_chat.id, update.effective_user.id)
+            self._awaiting_name[key] = (action, asyncio.get_running_loop().time())
+            who = "перевести в партнери" if action == "partner" else "повернути в інвестори"
             await update.message.reply_text(
-                f"Напишіть ім'я або @username клієнта, наприклад:\n/{action} Іван\n/{action} @ivan")
+                f"Кого {who}? Напишіть ім'я або @username клієнта (як він підписаний у Telegram).",
+                reply_markup=ForceReply(selective=True, input_field_placeholder="Ім'я або @username"),
+                do_quote=True)
             return
+        await self._offer_clients(update, action, query)
+
+    async def on_name_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Відповідь з ім'ям клієнта після /partner або /investor без імені."""
+        if not update.effective_chat or not update.effective_user or not update.message:
+            return
+        key = (update.effective_chat.id, update.effective_user.id)
+        pending = self._awaiting_name.get(key)
+        if pending is None:
+            return
+        action, asked_at = pending
+        if asyncio.get_running_loop().time() - asked_at > ASK_NAME_SECONDS:
+            self._awaiting_name.pop(key, None)
+            return
+        text = (update.message.text or "").strip()
+        if text.lower() in CANCEL_WORDS:
+            self._awaiting_name.pop(key, None)
+            await update.message.reply_text("Скасовано.")
+            return
+        if not self._allowed(update):
+            self._awaiting_name.pop(key, None)
+            return
+        if await self._offer_clients(update, action, text):
+            self._awaiting_name.pop(key, None)
+
+    async def _offer_clients(self, update: Update, action: str, query: str) -> bool:
+        """Шукає клієнтів і показує кнопки. Повертає False, якщо нікого не знайдено."""
         found = self.service.find_clients(query)
         if not found:
             await update.message.reply_text(
-                f"Не знайшов клієнта «{query}». Спробуйте частину імені або @username, "
-                f"як він підписаний у Telegram.")
-            return
+                f"Не знайшов клієнта «{query}». Напишіть іншу частину імені або @username "
+                f"(або «скасувати»).",
+                reply_markup=ForceReply(selective=True, input_field_placeholder="Ім'я або @username"),
+                do_quote=True)
+            return False
         _, _, verb = STATUS_ACTIONS[action]
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton(client_button_label(c), callback_data=f"{action}:{c.chat_id}")] for c in found])
         await update.message.reply_text(f"Кого {verb.split()[0]}? Натисніть на клієнта:", reply_markup=keyboard)
+        return True
 
     async def on_status_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query

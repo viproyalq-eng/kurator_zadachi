@@ -112,7 +112,7 @@ async def test_commands(app):
 
 
 async def test_handlers_registered(app):
-    assert len(app.application.handlers[0]) == 13
+    assert len(app.application.handlers[0]) == 14
 
 
 async def test_sheet_failure_notifies_once_then_recovers(app):
@@ -264,14 +264,14 @@ class Recorder:
         self.replies, self.markups, self.answers, self.edits = [], [], [], []
 
 
-def command_update(rec, chat_id, user_id):
+def command_update(rec, chat_id, user_id, text=""):
     async def reply(text, reply_markup=None, **kwargs):
         rec.replies.append(text)
         rec.markups.append(reply_markup)
 
     return SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id),
                            effective_user=SimpleNamespace(id=user_id),
-                           message=SimpleNamespace(reply_text=reply, reply_html=reply))
+                           message=SimpleNamespace(reply_text=reply, reply_html=reply, text=text))
 
 
 def button_update(rec, data, chat_id, user_id):
@@ -313,8 +313,6 @@ async def test_partner_flow_in_tasks_group(app):
 async def test_partner_command_hints_and_permissions(app):
     app.cfg.tasks_chat_id = -1001
     rec = Recorder()
-    await app.cmd_partner(command_update(rec, -1001, 555), SimpleNamespace(args=[]))
-    assert "/partner Іван" in rec.replies[-1]
     await app.cmd_partner(command_update(rec, -1001, 555), SimpleNamespace(args=["нікого"]))
     assert "Не знайшов" in rec.replies[-1]
     await app.cmd_partner(command_update(rec, -999, 555), SimpleNamespace(args=["іван"]))  # чужа група
@@ -341,3 +339,41 @@ async def test_refresh_stats_writes_grid(app):
     await app.refresh_stats()
     assert written and written[0][0][0] == "Статистика куратора"
     assert not app._stats_dirty
+
+
+async def test_partner_asks_for_name_then_shows_buttons(app):
+    from telegram import ForceReply
+    app.cfg.tasks_chat_id = -1001
+    await app.on_business_message(business_update("привіт"), SimpleNamespace())  # клієнт id 100
+    rec = Recorder()
+    # натиснули /partner у меню — команда пішла без імені
+    await app.cmd_partner(command_update(rec, -1001, 555), SimpleNamespace(args=[]))
+    assert "Кого перевести в партнери" in rec.replies[-1]
+    assert isinstance(rec.markups[-1], ForceReply)
+
+    # інший учасник групи пише щось своє — бот не реагує
+    await app.on_name_reply(command_update(rec, -1001, 666, "привіт усім"), SimpleNamespace())
+    assert len(rec.replies) == 1
+
+    # ім'я з помилкою — бот перепитує і далі чекає
+    await app.on_name_reply(command_update(rec, -1001, 555, "Мирослав"), SimpleNamespace())
+    assert "Не знайшов" in rec.replies[-1]
+
+    # правильне ім'я — кнопки
+    await app.on_name_reply(command_update(rec, -1001, 555, "@ivan"), SimpleNamespace())
+    assert rec.markups[-1].inline_keyboard[0][0].callback_data == "partner:100"
+
+    # після цього звичайні повідомлення вже не перехоплюються
+    count = len(rec.replies)
+    await app.on_name_reply(command_update(rec, -1001, 555, "Іван"), SimpleNamespace())
+    assert len(rec.replies) == count
+
+
+async def test_partner_question_can_be_cancelled(app):
+    app.cfg.tasks_chat_id = -1001
+    rec = Recorder()
+    await app.cmd_investor(command_update(rec, -1001, 555), SimpleNamespace(args=[]))
+    assert "повернути в інвестори" in rec.replies[-1]
+    await app.on_name_reply(command_update(rec, -1001, 555, "Скасувати"), SimpleNamespace())
+    assert rec.replies[-1] == "Скасовано."
+    assert not app._awaiting_name

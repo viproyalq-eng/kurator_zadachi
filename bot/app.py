@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 import traceback
 from datetime import date, datetime, timedelta, timezone
 
@@ -19,6 +21,8 @@ from .logic import client_display_name, message_text
 from .notify import Notifier
 from .service import BotService, IncomingMessage, cold_row, partner_row
 from .sheets import SheetWriter, explain_error
+from .backup import (LAST_BACKUP_KEY, TELEGRAM_SEND_LIMIT, BackupError, extract_backup, is_backup_name,
+                     make_backup, replace_database, rotate)
 from .efficiency import EFFICIENCY_TAB
 from .importer import ImportError_, load_bytes, parse_export
 from .stats import BOT_STARTED_KEY, build_report, report_grid, summary_text
@@ -44,6 +48,7 @@ COMMANDS = [
     BotCommand("warm", "Повернути з холодних"),
     BotCommand("stats", "Статистика роботи куратора"),
     BotCommand("import", "Завантажити старі чати (файл експорту Telegram)"),
+    BotCommand("backup", "Зробити бекап бази зараз (лише адміни, в особистих)"),
     BotCommand("chatid", "ID цього чату"),
     BotCommand("id", "Ваш Telegram ID"),
 ]
@@ -128,7 +133,116 @@ class BotApp:
         self._stats_dirty = True
         # (чат, користувач) -> (дія, коли спитали): бот чекає ім'я клієнта після /partner чи /investor
         self._awaiting_name: dict[tuple[int, int], tuple[str, float]] = {}
+        self._restore_pending: tuple[Path, dict] | None = None
+        self._exit = os._exit  # після відновлення бази бот перезапускається (Railway підніме його знову)
         self._register()
+
+    # --- резервні копії ---
+    @property
+    def backup_dir(self) -> Path:
+        return Path(self.cfg.db_path).resolve().parent / "backups"
+
+    def _can_backup(self, user_id: int | None) -> bool:
+        return user_id is not None and (user_id in self.cfg.backup_recipients or user_id in self.cfg.admin_chat_ids)
+
+    async def send_backup(self, reason: str = "щоденний") -> bool:
+        """Робить копію бази і надсилає її лише отримувачам бекапу (не в групу і не куратору)."""
+        now = datetime.now(timezone.utc)
+        try:
+            path, stats = await asyncio.to_thread(make_backup, self.db.conn, self.backup_dir, now, self.cfg.timezone)
+            await asyncio.to_thread(rotate, self.backup_dir)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Не вдалося зробити бекап")
+            await self.notifier.notify(f"⚠️ Не вдалося зробити бекап бази: {type(e).__name__}: {e}",
+                                       key="backup", cooldown=3600)
+            return False
+        size = path.stat().st_size
+        when = now.astimezone(self.cfg.timezone).strftime("%d.%m.%Y %H:%M")
+        caption = (f"💾 Бекап бази ({reason}) — {when}\n"
+                   f"Клієнтів: {stats['clients']}, повідомлень: {stats['messages']}, задач: {stats['tasks']}.\n"
+                   f"Зберігайте файл. Щоб відновити — надішліть його цьому боту.")
+        if size > TELEGRAM_SEND_LIMIT:
+            await self.notifier.notify(
+                f"⚠️ Бекап {size / 1e6:.0f} МБ — більше, ніж Telegram дозволяє надіслати (50 МБ). "
+                f"Копія збережена на диску Railway: {path}")
+            return False
+        sent = False
+        for chat_id in self.cfg.backup_recipients:
+            try:
+                with open(path, "rb") as fh:
+                    await self.application.bot.send_document(chat_id=chat_id, document=fh,
+                                                             filename=path.name, caption=caption)
+                sent = True
+            except Exception as e:  # noqa: BLE001
+                log.exception("Не вдалося надіслати бекап %s", chat_id)
+                await self.notifier.notify(f"⚠️ Не вдалося надіслати бекап ({chat_id}): {type(e).__name__}: {e}",
+                                           key="backup_send", cooldown=3600)
+        if not self.cfg.backup_recipients:
+            log.warning("Немає кому надсилати бекап: задайте ADMIN_CHAT_ID або BACKUP_CHAT_ID")
+        return sent
+
+    async def cmd_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._can_backup(update.effective_user.id if update.effective_user else None):
+            await update.message.reply_text("Бекап можуть робити лише адміни.")
+            return
+        await update.message.reply_text("⏳ Роблю бекап…")
+        if not await self.send_backup("вручну"):
+            await update.message.reply_text("Не вийшло — деталі в повідомленні вище.")
+
+    async def _offer_restore(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.message
+        doc = message.document
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            data = await tg_file.download_as_bytearray()
+            pending = self.backup_dir / "restore-pending.db"
+            stats = await asyncio.to_thread(extract_backup, bytes(data), pending)
+        except BackupError as e:
+            await message.reply_text(f"❌ {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            log.exception("Помилка читання бекапу")
+            await message.reply_text(f"❌ Не вдалося прочитати бекап: {type(e).__name__}: {e}")
+            return
+        self._restore_pending = (pending, stats)
+        current = self.db.stats()
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Відновити з цього бекапу", callback_data="restore:yes")],
+                                         [InlineKeyboardButton("Скасувати", callback_data="restore:no")]])
+        await message.reply_text(
+            f"Бекап «{doc.file_name}»: клієнтів {stats['clients']}, повідомлень {stats['messages']}, "
+            f"задач {stats['tasks']}.\n"
+            f"Зараз у базі: клієнтів {current['clients']}, повідомлень {current['messages']}.\n\n"
+            "Відновити? Поточна база спершу збережеться окремою копією, потім бот перезапуститься (~1 хв).",
+            reply_markup=keyboard)
+
+    async def on_restore_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not self._can_backup(query.from_user.id if query.from_user else None):
+            await query.answer("Лише для адмінів.", show_alert=True)
+            return
+        if query.data == "restore:no" or self._restore_pending is None:
+            self._restore_pending = None
+            await query.answer()
+            await query.edit_message_text("Відновлення скасовано.")
+            return
+        pending, stats = self._restore_pending
+        self._restore_pending = None
+        await query.answer("Відновлюю…")
+        try:
+            # страховка: поточна база теж зберігається
+            await asyncio.to_thread(make_backup, self.db.conn, self.backup_dir, datetime.now(timezone.utc),
+                                    self.cfg.timezone)
+            self.db.close()
+            await asyncio.to_thread(replace_database, self.cfg.db_path, pending)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Не вдалося відновити базу")
+            await query.edit_message_text(f"❌ Не вдалося відновити: {type(e).__name__}: {e}")
+            return
+        await query.edit_message_text(
+            f"✅ Базу відновлено (клієнтів {stats['clients']}, повідомлень {stats['messages']}). "
+            f"Бот перезапускається — за хвилину прийде «Бот запущено».")
+        asyncio.get_running_loop().call_later(2, self._exit, 1)
+
 
     def _allowed(self, update: Update) -> bool:
         """Робочі команди: у групі задач (будь-хто з учасників) або адміни в будь-якому чаті."""
@@ -228,6 +342,9 @@ class BotApp:
                 # Привітання й нагадування, яким настав час (лише в робочі години).
                 await self.service.process_scheduled()
                 now_local = datetime.now(self.cfg.timezone)
+                if is_due(now_local, self.cfg.backup_time, self.db.get_setting(LAST_BACKUP_KEY)):
+                    self.db.set_setting(LAST_BACKUP_KEY, now_local.date().isoformat())
+                    await self.send_backup()
                 if is_due(now_local, self.cfg.tasks_time, self.db.get_setting(LAST_RUN_KEY)):
                     # Позначаємо одразу, щоб у разі помилки не надсилати список кожні 30 секунд.
                     self.db.set_setting(LAST_RUN_KEY, now_local.date().isoformat())
@@ -281,6 +398,8 @@ class BotApp:
         app.add_handler(CommandHandler("warm", self.cmd_warm, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("stats", self.cmd_stats, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("import", self.cmd_import, filters=PRIVATE_ONLY))
+        app.add_handler(CommandHandler("backup", self.cmd_backup, filters=PRIVATE_ONLY))
+        app.add_handler(CallbackQueryHandler(self.on_restore_button, pattern=r"^restore:(yes|no)$"))
         app.add_handler(MessageHandler(PRIVATE_ONLY & filters.Document.ALL, self.on_document))
         app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND,
                                        self.on_name_reply))
@@ -528,6 +647,12 @@ class BotApp:
         doc = message.document
         user_id = update.effective_user.id if update.effective_user else None
         name = (doc.file_name or "").lower()
+        if is_backup_name(name):
+            if not self._can_backup(user_id):
+                await message.reply_text("Відновлювати базу можуть лише адміни.")
+                return
+            await self._offer_restore(update, context)
+            return
         if not (name.endswith(".json") or name.endswith(".zip")):
             if self._can_import(user_id):
                 await message.reply_text("Для імпорту потрібен файл result.json або zip з ним.")
@@ -593,6 +718,7 @@ class BotApp:
             "/warm — повернути з холодних\n"
             "/stats — статистика роботи куратора\n"
             "/import — завантажити старі чати (файл експорту)\n"
+            "/backup — бекап бази зараз (адміни)\n"
             "/status — стан бота (лише для адміна)")
 
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -692,6 +818,9 @@ class BotApp:
         lines.append(f"🕖 Пише клієнтам з {self.cfg.send_from.strftime('%H:%M')} до "
                      f"{self.cfg.send_until.strftime('%H:%M')}; нагадування через "
                      f"{self.cfg.reminder_delay_minutes} хв без відповіді.")
+        lines.append(f"💾 Бекап бази щодня о {self.cfg.backup_time.strftime('%H:%M')} — "
+                     + (f"надсилаю {', '.join(map(str, self.cfg.backup_recipients))}"
+                        if self.cfg.backup_recipients else "немає кому надсилати (задайте ADMIN_CHAT_ID)"))
         lines.append(f"🗓 Задачі щодня о {self.cfg.tasks_time.strftime('%H:%M')} "
                      + (f"у групу {tasks_chat}." if tasks_chat else "— група ще не задана, надсилатиму вам."))
         if self.sheets:

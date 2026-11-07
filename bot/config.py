@@ -42,6 +42,12 @@ class Config:
     reminder_delay_minutes: int = 120
     send_from: time = field(default_factory=lambda: time(7, 0))     # бот пише клієнтам лише з…
     send_until: time = field(default_factory=lambda: time(20, 30))  # …і до (за TIMEZONE)
+    backup_chat_ids: list[int] = field(default_factory=list)  # кому надсилати бекап (порожньо — першому адміну)
+    backup_time: time = field(default_factory=lambda: time(3, 0))
+
+    @property
+    def backup_recipients(self) -> list[int]:
+        return self.backup_chat_ids or self.admin_chat_ids[:1]
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -150,6 +156,14 @@ def load_config(env: dict | None = None) -> Config:
         warnings.append("SEND_FROM має бути раніше за SEND_UNTIL — використовую 07:00–20:30.")
         send_from, send_until = time(7, 0), time(20, 30)
 
+    backup_ids: list[int] = []
+    for part in (env.get("BACKUP_CHAT_ID") or "").replace(";", ",").replace(" ", ",").split(","):
+        if part.strip():
+            try:
+                backup_ids.append(int(part.strip()))
+            except ValueError:
+                warnings.append(f"BACKUP_CHAT_ID: «{part.strip()}» не схоже на ID, пропускаю.")
+
     team_raw = env.get("EXCLUDED_USERNAMES")
     team_list = team_raw.split(",") if team_raw is not None else DEFAULT_TEAM_USERNAMES
     team = {u.strip().lstrip("@").lower() for u in team_list if u.strip().lstrip("@")}
@@ -173,5 +187,7 @@ def load_config(env: dict | None = None) -> Config:
         reminder_delay_minutes=_int("REMINDER_DELAY_MINUTES", 120),
         send_from=send_from,
         send_until=send_until,
+        backup_chat_ids=backup_ids,
+        backup_time=_hhmm("BACKUP_TIME", time(3, 0)),
         warnings=warnings,
     )

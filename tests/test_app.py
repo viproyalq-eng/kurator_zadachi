@@ -115,7 +115,7 @@ async def test_commands(app):
 
 
 async def test_handlers_registered(app):
-    assert len(app.application.handlers[0]) == 18
+    assert len(app.application.handlers[0]) == 20
 
 
 async def test_sheet_failure_notifies_once_then_recovers(app):
@@ -243,7 +243,9 @@ async def test_cmd_tasks_permissions(app):
 
 async def test_scheduler_runs_once_per_day(app, sent_to, monkeypatch):
     import bot.app as appmod
+    from bot.backup import LAST_BACKUP_KEY
     app.cfg.tasks_chat_id = -1001
+    app.db.set_setting(LAST_BACKUP_KEY, app._today_local().isoformat())  # бекап сьогодні вже зроблено
     from datetime import time
     app.cfg.tasks_time = time(0, 0)  # «вже пора»
     calls = []

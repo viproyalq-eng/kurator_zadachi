@@ -269,3 +269,15 @@ def test_list_tab_is_rewritten(writer):
     w.write_partner_list([["Олена", ""]])
     rows = ss.tabs["Партнери"].rows
     assert rows[0][0] == "Клієнт" and rows[1] == ["Олена", ""] and len(rows) == 2
+
+
+
+def test_task_lists_move_between_tabs(writer):
+    w, ss = writer
+    w.write_task_lists([["07.11.2026", "Іван", "", "1"], ["07.11.2026", "Оля", "", "2"]], [])
+    assert len(ss.tabs["Задачі"].rows) == 3 and ss.tabs["Виконані задачі"].rows[0][0] == "Дата задачі"
+    for title in ("Задачі", "Виконані задачі"):
+        ss.tabs[title].clear = (lambda t=title: setattr(ss.tabs[t], "rows", []))
+    w.write_task_lists([["07.11.2026", "Оля", "", "2"]], [["07.11.2026", "Іван", "", "1", "", "", "07.11.2026 10:00"]])
+    assert [r[1] for r in ss.tabs["Задачі"].rows[1:]] == ["Оля"]
+    assert [r[1] for r in ss.tabs["Виконані задачі"].rows[1:]] == ["Іван"]

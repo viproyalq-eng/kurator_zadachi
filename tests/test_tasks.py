@@ -65,7 +65,9 @@ def test_picks_oldest_first_with_limits(tmp_path):
     add_client(db, 8, 600, username="VladBazil")     # команда
     tasks = service.create_daily_tasks(TODAY, NOW)
     assert [t.chat_id for t in tasks] == [1, 6, 5]
-    assert len(sheets.tasks) == 3
+    assert service.tasks_dirty
+    open_rows, done_rows = service.task_lists()
+    assert [r[3] for r in open_rows] == ["1", "6", "5"] and done_rows == []
 
 
 def test_ten_days_boundary(tmp_path):
@@ -99,7 +101,9 @@ async def test_curator_message_completes_task(tmp_path):
     assert db.tasks_for(TODAY)[0].done_at is None
     await msg(777, 2)  # Віктор написав
     assert db.tasks_for(TODAY)[0].done_at is not None
-    assert sheets.tasks[("06.11.2026", "1")][6] != ""
+    # рядок перейшов з «Задач» у «Виконані задачі» разом з датою виконання
+    open_rows, done_rows = service.task_lists()
+    assert open_rows == [] and done_rows[0][3] == "1" and done_rows[0][6] != ""
     # після контакту клієнт не потрапить у задачі найближчі 10 днів
     tomorrow = NOW + timedelta(days=1)
     assert service.create_daily_tasks("2026-11-07", tomorrow) == []
@@ -226,7 +230,7 @@ async def test_touch_text_and_reply_are_tracked(tmp_path):
     await msg(1, 3, "Все отлично", 5)
     task = db.tasks_for(TODAY)[0]
     assert task.replied_at is not None
-    row = sheets.tasks[("06.11.2026", "1")]
+    row = service.task_lists()[1][0]
     assert row[7] == "Добрый день! Как успехи с роботом?" and row[8] != ""
 
 

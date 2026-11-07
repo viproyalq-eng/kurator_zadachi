@@ -11,7 +11,6 @@ from typing import Awaitable, Callable
 from .config import Config
 from .db import CLIENT_NEW, CLIENT_OLD, STATUS_INVESTOR, STATUS_PARTNER, Client, Database, Scheduled, Task
 from .logic import SENDER_BOT, SENDER_CLIENT, fmt_dt, is_bonus
-from .sheets import TASKS_TAB
 from .schedule import in_send_window, next_send_time, reply_deadline
 from .tasks import chat_url, cutoff_utc, person_link, task_row
 from .notify import Notifier
@@ -91,6 +90,7 @@ class BotService:
                  send: SendFn, resolve_owner: OwnerFn,
                  notify_group: Callable[[str], Awaitable[object]] | None = None):
         self.notify_group = notify_group  # повідомлення в групу «Задачі куратора» (HTML)
+        self.tasks_dirty = False          # треба переписати вкладки задач у таблиці
         self.cfg = cfg
         self.db = db
         self.sheets = sheets  # SheetWriter або None, якщо таблиця не налаштована
@@ -464,8 +464,15 @@ class BotService:
         return client, True
 
     def _queue_task(self, task: Task) -> None:
-        if self.sheets:
-            self.sheets.queue_upsert(TASKS_TAB, task_row(task, self.cfg.timezone))
+        # Вкладки «Задачі» і «Виконані задачі» переписуються цілком (див. task_lists) —
+        # тут лише позначаємо, що їх треба оновити найближчим часом.
+        self.tasks_dirty = True
+
+    def task_lists(self) -> tuple[list[list], list[list]]:
+        """Рядки для вкладок: (невиконані, виконані)."""
+        tz = self.cfg.timezone
+        return ([task_row(t, tz) for t in self.db.tasks_by_state(done=False)],
+                [task_row(t, tz) for t in self.db.tasks_by_state(done=True)])
 
     @staticmethod
     def _client_label(client: Client) -> str:

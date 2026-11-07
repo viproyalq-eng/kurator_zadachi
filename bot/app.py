@@ -233,7 +233,8 @@ class BotApp:
                 elif self.sheets and loop.time() - last_flags_sync > FLAGS_SYNC_SECONDS:
                     last_flags_sync = loop.time()
                     await self._sync_not_client_flags()
-                if self.sheets and (self._stats_dirty or loop.time() - last_stats > STATS_SECONDS):
+                if self.sheets and (self._stats_dirty or self.service.tasks_dirty
+                                    or loop.time() - last_stats > STATS_SECONDS):
                     last_stats = loop.time()
                     # спершу дописуємо чергу, щоб статистика й інші вкладки збігалися
                     await self._flush_sheets_once()
@@ -489,7 +490,10 @@ class BotApp:
         grid = report_grid(self._build_report(), self.cfg.timezone)
         cold_rows = [cold_row(c, self.cfg.timezone) for c in self.db.cold_clients() if not c.excluded]
         partner_rows = [partner_row(c, self.cfg.timezone) for c in self.db.partner_clients()]
+        open_rows, done_rows = self.service.task_lists()
+        self.service.tasks_dirty = False
         try:
+            await asyncio.to_thread(self.sheets.write_task_lists, open_rows, done_rows)
             await asyncio.to_thread(self.sheets.write_stats, grid)
             await asyncio.to_thread(self.sheets.write_partner_list, partner_rows)
             await asyncio.to_thread(self.sheets.write_cold_list, cold_rows)

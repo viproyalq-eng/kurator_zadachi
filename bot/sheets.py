@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 MESSAGES_TAB = "Повідомлення"
 CLIENTS_TAB = "Клієнти"
 TASKS_TAB = "Задачі"
+DONE_TASKS_TAB = "Виконані задачі"
 
 MESSAGES_HEADER = ["Дата", "Клієнт", "Username", "ID чату", "Хто написав", "Текст"]
 CLIENTS_HEADER = ["ID чату", "Клієнт", "Username", "Тип", "Перший контакт",
@@ -184,6 +185,7 @@ class SheetWriter:
         self._worksheet(MESSAGES_TAB, MESSAGES_HEADER)
         self._worksheet(CLIENTS_TAB, CLIENTS_HEADER)
         self._worksheet(TASKS_TAB, TASKS_HEADER)
+        self._worksheet(DONE_TASKS_TAB, TASKS_HEADER)
         return self._open().title
 
     # --- вкладки-списки «Партнери» і «Холодні» (переписуються цілком) ---
@@ -206,6 +208,11 @@ class SheetWriter:
 
     def write_partner_list(self, rows: list[list]) -> None:
         self.write_list(PARTNERS_TAB, PARTNERS_HEADER, rows)
+
+    def write_task_lists(self, open_rows: list[list], done_rows: list[list]) -> None:
+        """«Задачі» — лише невиконані; «Виконані задачі» — виконані, з текстом дотику й відповіддю."""
+        self.write_list(TASKS_TAB, TASKS_HEADER, open_rows)
+        self.write_list(DONE_TASKS_TAB, TASKS_HEADER, done_rows)
 
     # --- вкладка «Статистика» ---
     def write_stats(self, grid: list[list]) -> None:

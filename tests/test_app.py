@@ -346,6 +346,9 @@ async def test_refresh_stats_writes_grid(app):
         def write_cold_list(self, rows):
             pass
 
+        def write_task_lists(self, open_rows, done_rows):
+            pass
+
     app.sheets = Sheets()
     await app.refresh_stats()
     assert written and written[0][0][0] == "Статистика куратора"
@@ -450,6 +453,9 @@ async def test_cold_list_written_to_sheet(app):
 
         def write_partner_list(self, rows):
             written["partners"] = rows
+
+        def write_task_lists(self, open_rows, done_rows):
+            written["tasks"] = (open_rows, done_rows)
 
         def queue_client(self, *a, **k):
             pass

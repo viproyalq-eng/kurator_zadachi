@@ -416,6 +416,17 @@ class Database:
         self.conn.commit()
         return [t for d in dates for t in self.tasks_for(d) if t.chat_id == chat_id]
 
+    def tasks_by_state(self, done: bool) -> list[Task]:
+        """Невиконані (свіжі дні першими) або виконані (останні виконані першими) — з іменами клієнтів."""
+        if done:
+            where, order = "t.done_at IS NOT NULL", "t.done_at DESC"
+        else:
+            where, order = "t.done_at IS NULL", "t.task_date DESC, t.position ASC"
+        rows = self.conn.execute(
+            f"""SELECT t.*, c.name AS name, c.username AS username FROM tasks t
+                LEFT JOIN clients c ON c.chat_id = t.chat_id WHERE {where} ORDER BY {order}""")
+        return [Task(**dict(r)) for r in rows]
+
     def all_tasks(self) -> list[Task]:
         return [Task(**dict(r)) for r in self.conn.execute("SELECT * FROM tasks")]
 

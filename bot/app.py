@@ -620,18 +620,25 @@ class BotApp:
         self.service.tasks_dirty = False
         eff = self.service.efficiency(datetime.now(timezone.utc))
         (stages_hdr, stages_data), course = self.service.course_tabs(datetime.now(timezone.utc))
-        try:
-            await asyncio.to_thread(self.sheets.write_task_lists, open_rows, done_rows)
-            await asyncio.to_thread(self.sheets.write_dashboard, EFFICIENCY_TAB, eff.rows, eff.styles)
-            await asyncio.to_thread(self.sheets.write_stages, stages_hdr, stages_data)
-            await asyncio.to_thread(self.sheets.write_dashboard, COURSE_TAB, course.rows, course.styles,
-                                    course_chart_specs)
-            await asyncio.to_thread(self.sheets.write_stats, grid)
-            await asyncio.to_thread(self.sheets.write_partner_list, partner_rows)
-            await asyncio.to_thread(self.sheets.write_cold_list, cold_rows)
-        except Exception as e:  # noqa: BLE001
-            log.exception("Не вдалося оновити вкладки статистики")
-            await self.notifier.notify(f"⚠️ Не вдалося оновити вкладки статистики.\n{self._explain_sheets(e)}",
+        # Кожна вкладка — окремо: помилка в одній не зупиняє оновлення інших.
+        jobs = [
+            ("Задачі / Виконані задачі", self.sheets.write_task_lists, (open_rows, done_rows)),
+            (EFFICIENCY_TAB, self.sheets.write_dashboard, (EFFICIENCY_TAB, eff.rows, eff.styles)),
+            ("Етапи клієнтів", self.sheets.write_stages, (stages_hdr, stages_data)),
+            (COURSE_TAB, self.sheets.write_dashboard, (COURSE_TAB, course.rows, course.styles, course_chart_specs)),
+            ("Діаграми ефективності", self.sheets.write_stats, (grid,)),
+            ("Партнери", self.sheets.write_partner_list, (partner_rows,)),
+            ("Холодні", self.sheets.write_cold_list, (cold_rows,)),
+        ]
+        failed = []
+        for name, fn, args in jobs:
+            try:
+                await asyncio.to_thread(fn, *args)
+            except Exception as e:  # noqa: BLE001
+                log.exception("Не вдалося оновити вкладку %s", name)
+                failed.append(f"• «{name}»: {self._explain_sheets(e)}")
+        if failed:
+            await self.notifier.notify("⚠️ Не вдалося оновити вкладки:\n" + "\n".join(failed),
                                        key="stats", cooldown=SHEETS_ERROR_COOLDOWN)
 
     # --- імпорт старих чатів ---

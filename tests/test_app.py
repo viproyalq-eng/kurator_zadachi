@@ -493,3 +493,34 @@ async def test_status_shows_round(app):
     rec = Recorder()
     await app.cmd_status(command_update(rec, 1, 1), SimpleNamespace(args=[]))
     assert "Коло №1: пройдено 0 з 0" in rec.replies[-1] and "Таблиця" in rec.replies[-1]
+
+
+
+async def test_one_broken_tab_does_not_stop_others(app):
+    done = []
+
+    class Sheets:
+        def write_task_lists(self, *a):
+            done.append("tasks")
+
+        def write_dashboard(self, title, *a, **k):
+            if title == "Ефективність клієнта":
+                raise RuntimeError("Invalid requests[0].addChart")
+            done.append(title)
+
+        def write_stages(self, *a):
+            done.append("stages")
+
+        def write_stats(self, *a):
+            done.append("stats")
+
+        def write_partner_list(self, *a):
+            done.append("partners")
+
+        def write_cold_list(self, *a):
+            done.append("cold")
+
+    app.sheets = Sheets()
+    await app.refresh_stats()
+    assert done == ["tasks", "Ефективність куратора", "stages", "stats", "partners", "cold"]
+    assert "«Ефективність клієнта»" in app.admin[-1] and "addChart" in app.admin[-1]

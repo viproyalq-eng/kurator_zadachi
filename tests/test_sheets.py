@@ -255,6 +255,27 @@ def test_explain_unknown():
 
 # --- вкладка «Статистика» і діаграми ---
 
+def validate_chart(spec: dict) -> None:
+    """Правила Google Sheets API для діаграм, на яких ми вже спотикались (і схожі)."""
+    if "pieChart" in spec:
+        return
+    b = spec["basicChart"]
+    assert b["chartType"] in {"COLUMN", "LINE", "AREA", "STEPPED_AREA", "BAR", "COMBO", "SCATTER"}
+    value_axis = "BOTTOM_AXIS" if b["chartType"] == "BAR" else "LEFT_AXIS"
+    for s in b["series"]:
+        if b["chartType"] == "BAR":
+            assert s["targetAxis"] == "BOTTOM_AXIS", "Bar charts series may only target the BOTTOM_AXIS"
+        else:
+            assert s["targetAxis"] in ("LEFT_AXIS", "RIGHT_AXIS")
+    assert {a["position"] for a in b.get("axis", [])} <= {"BOTTOM_AXIS", "LEFT_AXIS", "RIGHT_AXIS"}
+    assert value_axis in {a["position"] for a in b.get("axis", [])}
+    dom = b["domains"][0]["domain"]["sourceRange"]["sources"][0]
+    for s in b["series"]:
+        src = s["series"]["sourceRange"]["sources"][0]
+        assert (src["startRowIndex"], src["endRowIndex"]) == (dom["startRowIndex"], dom["endRowIndex"])
+        assert src["endColumnIndex"] - src["startColumnIndex"] == 1
+
+
 def _chart_api(ss):
     """Імітація Google API для діаграм: пам'ятає назви доданих діаграм по вкладках."""
     batches, charts = [], {}
@@ -276,6 +297,7 @@ def _chart_api(ss):
                 anchor = r["addChart"]["chart"]["position"]["overlayPosition"]["anchorCell"]
                 sid = anchor["sheetId"]
                 ws = next(w for w in ss.tabs.values() if w.id == sid)
+                validate_chart(r["addChart"]["chart"]["spec"])
                 if anchor["columnIndex"] >= ws.col_count:   # як Google: не можна за межами вкладки
                     raise RuntimeError(f"GridCoordinate.columnIndex[{anchor['columnIndex']}] is after last "
                                        f"column in grid[{ws.col_count - 1}]")
@@ -400,3 +422,13 @@ def test_dashboard_charts_fit_into_new_narrow_tab(writer):
     assert ws.col_count >= 11 + 8 and len(charts[ws.id]) == 3
     w.write_dashboard(COURSE_TAB, rows, [(0, "title")], course_chart_specs)
     assert len(charts[ws.id]) == 3                      # без дублів
+
+
+
+def test_all_chart_specs_follow_google_rules():
+    from bot.course import course_chart_specs
+    from bot.stats import chart_specs
+    specs = chart_specs(1) + course_chart_specs(2)
+    assert len(specs) == 12
+    for title, spec, row in specs:
+        validate_chart(spec)

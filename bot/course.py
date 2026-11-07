@@ -261,7 +261,7 @@ def course_chart_specs(sheet_id: int) -> list[tuple[str, dict, int]]:
     n = len(STAGES)
     return [
         ("🎓 Воронка курсу: скільки дійшли до кожного етапу",
-         {"basicChart": _basic(sheet_id, FUNNEL_HEADER_ROW, n, "BAR", [1], "Людей", "Етап")}, 0),
+         {"basicChart": _basic(sheet_id, FUNNEL_HEADER_ROW, n, "COLUMN", [1], "Людей", "Етап")}, 0),
         ("⏳ Середня кількість днів на етапі",
          {"basicChart": _basic(sheet_id, FUNNEL_HEADER_ROW, n, "COLUMN", [4], "Днів", "Етап")}, 18),
         ("🕳 Де пропадають (зараз мовчать після теми)",

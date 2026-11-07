@@ -38,7 +38,7 @@ def test_detect_nothing_and_variants():
     assert detect_topics(None) == []
     assert detect_topics("https://youtube.com/shorts/DYSB1DXN2So?si=x") == ["t3"]
     assert detect_topics("https://youtu.be/AAAAAAAAAAA") == []          # чуже відео
-    assert len(TOPICS) == 12 and [k for k, _ in STAGES][-1] == "partner"
+    assert len(TOPICS) == 16 and [k for k, _ in STAGES][-1] == "partner"
 
 
 class Env:
@@ -209,9 +209,74 @@ def test_hidden_link_in_export_and_reimport_updates_stages(tmp_path):
 def test_course_check_lists_unknown_videos():
     from bot.course import course_check
     texts = [(1, "2025-01-10T10:00:00+00:00", "Тема 1 https://youtu.be/wWj68CilMN0"),
-             (2, "2025-01-11T10:00:00+00:00", "Тема 1 (старое видео) https://youtu.be/OLDvideo001"),
-             (3, "2025-02-11T10:00:00+00:00", "Тема 1 (старое видео) https://youtu.be/OLDvideo001"),
+             (2, "2025-01-11T10:00:00+00:00", "Старое видео https://youtu.be/OLDvideo001"),
+             (3, "2025-02-11T10:00:00+00:00", "Старое видео https://youtu.be/OLDvideo001"),
              (3, "2025-02-12T10:00:00+00:00", "Добрый день!")]
     report = course_check(texts, KYIV)
     assert "з посиланням на YouTube: 3" in report and "упізнано як тему курсу: 1 (у 1 клієнтів)" in report
     assert "<code>OLDvideo001</code> — 2 раз, 2 клієнтам, 11.01.25–11.02.25" in report
+
+
+
+@pytest.mark.parametrize("text,key", [
+    ("Тема 1: Статистика После прохождения Темы 1 - вышлите", "t1"),
+    ("Тема 2 - Интерфейс 🍄Видео - https://youtu.be/y_fpVf4cwTE", "t2"),      # старе відео — за підписом
+    ("📚 Тема 4. Часть 1 : Сколько денег нужно", "t4"),
+    ("Подтема 4.2 Объяснения PnL", "t4"),
+    ("Очень важная подтема 4.2Диверсификация https://youtu.be/jWfj5bEbX2M", "t4"),  # підпис важливіший за відео
+    ("Тема 6 - Экскурсия по клубу", "t6_1"),
+    ("Тема 13 - Маркетинг план Royal Q", "t13"),
+    ("Тема 15 - Перспективы Royal Q", "t15"),
+])
+def test_topic_by_header(text, key):
+    assert detect_topics(text) == [key]
+
+
+def test_mentions_are_not_headers():
+    assert detect_topics("После прохождения Темы 1 - вышлите скрин") == []
+    assert detect_topics("Тема 99: щось нове") == []
+
+
+def test_numeric_author_ids_in_export():
+    from bot.importer import parse_export
+    data = {"personal_information": {"user_id": 37806103218}, "chats": {"list": [
+        {"name": "Олена", "type": "personal_chat", "id": 555, "messages": [
+            {"id": 1, "type": "message", "date_unixtime": "1700000000", "from_id": 555, "text": "привіт"},
+            {"id": 2, "type": "message", "date_unixtime": "1700000100", "from_id": 37806103218, "text": "Тема 1"},
+            {"id": 3, "type": "message", "date_unixtime": "1700000200", "from_id": "user37806103218", "text": "ок"},
+            {"id": 4, "type": "message", "date_unixtime": "1700000300", "from_id": "37806103218", "text": "ок"},
+        ]}]}}
+    msgs = parse_export(data, KYIV).chats[0].messages
+    assert [m.from_owner for m in msgs] == [False, True, True, True]
+
+
+def test_versions_and_dashes_for_old_course():
+    from bot.course import course_version
+    old = {"t1": "2025-08-01T10:00:00+00:00", "t15": "2025-09-01T10:00:00+00:00"}
+    new = {"t1": "2026-08-01T10:00:00+00:00", "t3": "2026-08-05T10:00:00+00:00"}
+    c_old = Client(1, None, "Old", None, CLIENT_OLD, "2025-01-01T00:00:00+00:00", "2025-09-01T10:00:00+00:00",
+                   "Віктор", None, None)
+    c_new = Client(2, None, "New", None, CLIENT_OLD, "2026-01-01T00:00:00+00:00", "2026-08-05T10:00:00+00:00",
+                   "Віктор", None, None)
+    rows = stages_rows([c_old, c_new], {1: old, 2: new}, {}, KYIV)
+    by_name = {r[0]: dict(zip(stages_header(), r)) for r in rows}
+    assert by_name["Old"]["Версія курсу"] == "2025 (15 тем)" and by_name["Old"]["Тем отримано"] == "2 з 15"
+    assert by_name["Old"]["Тема 6 ч.2"] == "—" and by_name["Old"]["Тема 14"] == "❌"
+    assert by_name["New"]["Версія курсу"] == "нинішній (11 тем)" and by_name["New"]["Тема 12"] == "—"
+    assert by_name["New"]["Тема 2"] == "❌" and by_name["New"]["Тем отримано"] == "2 з 12"
+    assert course_version(None) is None
+
+
+async def test_old_silence_is_not_lost_alert(tmp_path):
+    e = Env(tmp_path)
+    await e.say("v", TOPIC_TEXT["t1"], day(0))
+    assert await e.service.check_lost(day(30)) == 0      # тиша понад 7 днів — не «щойно пропав»
+    assert e.group == []
+
+
+async def test_old_dropout_with_recent_touch_is_not_lost(tmp_path):
+    """З реальних даних: тему надіслали місяць тому, а нещодавно Віктор написав дотик — це не «щойно пропав»."""
+    e = Env(tmp_path)
+    await e.say("v", TOPIC_TEXT["t4"], day(0))
+    await e.say("v", "Привіт 👋 Як ваші справи з роботом?", day(27))
+    assert await e.service.check_lost(day(30)) == 0

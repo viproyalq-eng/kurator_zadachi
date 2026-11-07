@@ -14,7 +14,7 @@ from .db import CLIENT_NEW, CLIENT_OLD, STATUS_INVESTOR, STATUS_PARTNER, Client,
 from .logic import SENDER_BOT, SENDER_CLIENT, fmt_dt, is_bonus
 from .course import STAGE_BONUS, TOPIC_BY_KEY, detect_topics, latest_topic
 from .schedule import in_send_window, next_send_time, reply_deadline
-from .texts import LOST_AFTER_DAYS
+from .texts import LOST_AFTER_DAYS, LOST_MAX_DAYS, LOST_TOPIC_MAX_DAYS
 from .tasks import chat_url, cutoff_utc, person_link, task_row
 from .notify import Notifier
 
@@ -253,6 +253,10 @@ class BotService:
             since = self._ball_with_client_since(chat_id)
             if since is None or since.isoformat() < stored[key] or now - since < timedelta(days=LOST_AFTER_DAYS):
                 continue
+            if now - since > timedelta(days=LOST_MAX_DAYS):
+                continue  # давня тиша (напр. з імпортованої історії) — не «щойно пропав»
+            if now - datetime.fromisoformat(stored[key]) > timedelta(days=LOST_TOPIC_MAX_DAYS):
+                continue  # тема давня — людина давно кинула курс, її підхопить коло обходу
             self.db.record_stage(chat_id, f"lost:{key}", now.isoformat())
             self.stages_dirty = True
             alerted += 1
@@ -573,7 +577,7 @@ class BotService:
                 client.name = client.name or chat.name
                 if first.date.isoformat() < client.first_seen:
                     client.first_seen = first.date.isoformat()
-                if not client.last_message_at or last.date.isoformat() > client.last_message_at:
+                if not client.last_message_at or last.date.isoformat() >= client.last_message_at:
                     client.last_message_at = last.date.isoformat()
                     client.last_from = last_from
                 report.updated_clients += 1

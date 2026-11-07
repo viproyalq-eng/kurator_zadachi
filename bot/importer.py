@@ -123,11 +123,17 @@ def _date(m: dict, tz: ZoneInfo) -> datetime | None:
 
 
 def _user_id(from_id) -> int | None:
-    if isinstance(from_id, str) and from_id.startswith("user"):
+    """Автор повідомлення. Різні програми Telegram пишуть по-різному: "user123", "123" або просто 123."""
+    if isinstance(from_id, bool):
+        return None
+    if isinstance(from_id, int):
+        return from_id
+    if isinstance(from_id, str):
+        raw = from_id[4:] if from_id.startswith("user") else from_id
         try:
-            return int(from_id[4:])
+            return int(raw)
         except ValueError:
-            return None
+            return None  # "channel…" тощо
     return None
 
 

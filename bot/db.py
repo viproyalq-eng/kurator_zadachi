@@ -480,13 +480,13 @@ class Database:
 
     def add_messages_bulk(self, rows: list[tuple]) -> int:
         """rows: (chat_id, message_id, connection_id, sender, text, date_iso). Повертає, скільки додано нових.
-        Якщо повідомлення вже є — оновлюємо лише текст (повторний імпорт дописує «сховані» посилання)."""
+        Якщо повідомлення вже є — оновлюємо текст і автора (повторний імпорт виправляє попередній)."""
         before = self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         self.conn.executemany(
             """INSERT INTO messages (chat_id, message_id, business_connection_id, sender, text, date)
                VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(chat_id, message_id) DO UPDATE SET text=excluded.text
-               WHERE messages.text IS NOT excluded.text""", rows)
+               ON CONFLICT(chat_id, message_id) DO UPDATE SET text=excluded.text, sender=excluded.sender
+               WHERE messages.text IS NOT excluded.text OR messages.sender IS NOT excluded.sender""", rows)
         self.conn.commit()
         return self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] - before
 

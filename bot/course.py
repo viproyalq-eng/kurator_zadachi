@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from .texts import COURSE_TOPICS
+from .texts import COURSE_TOPICS, COURSE_VERSIONS
 
 _YT_ID = re.compile(r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:[^ ]*&)?v=|shorts/|live/|embed/))([A-Za-z0-9_-]{11})")
 
@@ -23,11 +23,45 @@ def _norm(text: str) -> str:
 
 
 TOPICS: list[Topic] = []
+TOPIC_BY_NUMBER: dict[tuple[int, int | None], str] = {}   # (номер, частина) -> ключ
+_LABEL = re.compile(r"тема\s*(\d+)(?:\s*ч\.?\s*(\d+))?", re.I)
 for _key, _label, _markers in COURSE_TOPICS:
     ids = tuple(m for m in _markers if re.fullmatch(r"[A-Za-z0-9_-]{11}", m))
     phrases = tuple(_norm(m) for m in _markers if m not in ids)
     TOPICS.append(Topic(_key, _label, ids, phrases))
+    _m = _LABEL.search(_label)
+    if _m:
+        TOPIC_BY_NUMBER.setdefault((int(_m.group(1)), int(_m.group(2)) if _m.group(2) else None), _key)
 TOPIC_BY_KEY = {t.key: t for t in TOPICS}
+TOPIC_NUMBER = {key: n for (n, _), key in TOPIC_BY_NUMBER.items()}
+
+# Підпис теми на початку повідомлення: «Тема 3:», «📚 Тема 4. Часть 1», «Подтема 4.2», «Тема 6 - …»
+_HEADER = re.compile(r"^\W{0,8}(?:под)?тема\s*(\d{1,2})(?:\s*[.,]\s*(?:часть|ч\.?)?\s*(\d))?(?!\d)", re.I)
+
+
+_SUBTOPIC = re.compile(r"\bподтема\s*(\d{1,2})(?:\s*[.,]\s*(\d))?", re.I)
+
+
+def topic_from_header(text: str | None) -> str | None:
+    flat = " ".join((text or "").split())
+    m = _HEADER.match(flat) or _SUBTOPIC.search(flat[:60])  # «Очень важная подтема 4.2 …»
+    if not m:
+        return None
+    n, part = int(m.group(1)), int(m.group(2)) if m.group(2) else None
+    return (TOPIC_BY_NUMBER.get((n, part)) or TOPIC_BY_NUMBER.get((n, None))
+            or TOPIC_BY_NUMBER.get((n, 1)))
+
+
+def course_version(first_topic_at: datetime | None) -> tuple[int, str] | None:
+    """(скільки тем, назва версії) — за датою першої теми клієнта."""
+    if first_topic_at is None:
+        return None
+    day = first_topic_at.date().isoformat()
+    chosen = None
+    for start, count, label in COURSE_VERSIONS:
+        if day >= start:
+            chosen = (count, label)
+    return chosen or (COURSE_VERSIONS[0][1], COURSE_VERSIONS[0][2])
 
 # Усі етапи по порядку. «Партнер» куратор ставить вручну (/partner).
 STAGE_BONUS, STAGE_WELCOME, STAGE_WELCOME_REPLY, STAGE_PARTNER = "bonus", "welcome", "welcome_reply", "partner"
@@ -44,9 +78,12 @@ LAST_TOPIC = TOPICS[-1].key if TOPICS else None
 
 
 def detect_topics(text: str | None) -> list[str]:
-    """Ключі тем, знайдених у повідомленні (за ID відео YouTube або фразою), у порядку курсу."""
+    """Ключі тем у повідомленні. Підпис «Тема N» на початку — головне; інакше — ID відео YouTube або фраза."""
     if not text:
         return []
+    by_header = topic_from_header(text)
+    if by_header:
+        return [by_header]
     ids = set(_YT_ID.findall(text))
     norm = _norm(text)
     found = []
@@ -110,7 +147,8 @@ def active_lost(stored: dict[str, str], last_client_msg: str | None) -> tuple[st
 
 
 def stages_header() -> list[str]:
-    return ["Клієнт", "Username", "ID чату", "Тип", "Тем отримано", "Поточний етап", "Етап з", "Пропав після",
+    return ["Клієнт", "Username", "ID чату", "Тип", "Версія курсу", "Тем отримано", "Поточний етап", "Етап з",
+            "Пропав після",
             "Бонус", "Привітання", "Відповів", *[t.label for t in TOPICS], "Партнер", "Посилання на чат"]
 
 
@@ -127,6 +165,9 @@ def stages_rows(clients, all_stored: dict[int, dict[str, str]], last_client: dic
         if not any(k in st for k in (STAGE_BONUS, STAGE_WELCOME, *TOPIC_BY_KEY)):
             continue
         cur = current_stage(st)
+        topic_dates = [st[t.key] for t in TOPICS if t.key in st]
+        version = course_version(min(topic_dates) if topic_dates else None)
+        in_version = [t for t in TOPICS if version is None or TOPIC_NUMBER.get(t.key, 0) <= version[0]]
         topics_got = sum(1 for t in TOPICS if t.key in st)
         last_key = latest_topic(st)
         lost = active_lost(stored, last_client.get(c.chat_id))
@@ -134,6 +175,10 @@ def stages_rows(clients, all_stored: dict[int, dict[str, str]], last_client: dic
         def cell(key: str) -> str:
             if key in st:
                 return f"{MARK_DONE} {_d(st[key], tz)}"
+            if key in TOPIC_BY_KEY and version and TOPIC_NUMBER.get(key, 0) > version[0]:
+                return "—"  # у версії курсу клієнта такої теми не було
+            if key in OPTIONAL_TOPICS and version and version[0] > 11:
+                return "—"  # у старих версіях тема 6 не ділилась на частини
             if key in OPTIONAL_TOPICS and last_key and STAGE_INDEX[last_key] > STAGE_INDEX[key]:
                 return MARK_SKIPPED
             if key in (STAGE_BONUS, STAGE_WELCOME, STAGE_WELCOME_REPLY) and c.client_type != "новий":
@@ -142,7 +187,9 @@ def stages_rows(clients, all_stored: dict[int, dict[str, str]], last_client: dic
 
         rows.append((STAGE_INDEX.get(cur, -1), st.get(cur).isoformat() if cur else "", [
             c.name or "Без імені", f"@{c.username}" if c.username else "", str(c.chat_id), c.client_type,
-            f"{topics_got} з {len(TOPICS)}", STAGE_LABELS.get(cur, "—") if cur else "—",
+            version[1] if version else "—",
+            f"{topics_got} з {len(in_version) - (1 if version and version[0] > 11 else 0)}",
+            STAGE_LABELS.get(cur, "—") if cur else "—",
             _d(st[cur], tz) if cur else "",
             f"⚠️ {TOPIC_BY_KEY[lost[0]].label if lost[0] in TOPIC_BY_KEY else lost[0]} ({_d(datetime.fromisoformat(lost[1]), tz)})"
             if lost else "",
@@ -156,7 +203,7 @@ def stages_rows(clients, all_stored: dict[int, dict[str, str]], last_client: dic
 
 # Фіксоване розташування воронки (на неї посилаються діаграми)
 FUNNEL_HEADER_ROW = 4
-FUNNEL_HEADER = ["Етап", "Дійшли", "% від бонусу", "% від попереднього", "Сер. днів на етапі",
+FUNNEL_HEADER = ["Етап", "Дійшли", "% від усіх у воронці", "% від попереднього", "Сер. днів на етапі",
                  "Медіана днів на етапі", "Сер. днів від бонусу", "Зараз на етапі", "Пропали тут (зараз)", "Пояснення"]
 COURSE_WIDTH = len(FUNNEL_HEADER)
 
@@ -178,17 +225,26 @@ def build_course_efficiency(clients, all_stored: dict[int, dict[str, str]], last
 
     active = [c for c in clients if not c.excluded]
     maps = {c.chat_id: stage_map(c, all_stored.get(c.chat_id, {})) for c in active}
-    cohort = [c for c in active if STAGE_BONUS in maps[c.chat_id]]
+
+    def version_of(c):
+        dates = [maps[c.chat_id][t.key] for t in TOPICS if t.key in maps[c.chat_id]]
+        return course_version(min(dates) if dates else None)
+
+    versions = {c.chat_id: version_of(c) for c in active}
+    current_label = COURSE_VERSIONS[-1][2]
+    # Воронка: хто написав «бонус» або почав нинішню версію курсу.
+    cohort = [c for c in active if STAGE_BONUS in maps[c.chat_id]
+              or (versions[c.chat_id] and versions[c.chat_id][1] == current_label)]
     lost_now = {c.chat_id: active_lost(all_stored.get(c.chat_id, {}), last_client.get(c.chat_id)) for c in active}
 
     add(["🎓 Ефективність клієнта — курс інвестора"], "title")
-    add([f"Оновлено: {now_utc.astimezone(tz).strftime('%d.%m.%Y %H:%M')}. Воронка — для тих, хто написав «бонус». "
-         f"Тема пройдена, коли надіслано наступну."], "note")
+    add([f"Оновлено: {now_utc.astimezone(tz).strftime('%d.%m.%Y %H:%M')}. Воронка — нинішня версія курсу "
+         f"(і всі, хто написав «бонус»). Тема пройдена, коли надіслано наступну."], "note")
     add([])
     add(["📊 Воронка курсу"], "section")
     add(FUNNEL_HEADER, "colheader")
     assert len(rows) == FUNNEL_HEADER_ROW + 1
-    bonus_n = sum(1 for c in cohort)
+    bonus_n = len(cohort)
     prev_n = None
     notes = {STAGE_BONUS: "Усі, хто написав «бонус»", STAGE_WELCOME_REPLY: "Почали діалог",
              STAGE_PARTNER: "Ставить куратор вручну (/partner)",
@@ -200,9 +256,9 @@ def build_course_efficiency(clients, all_stored: dict[int, dict[str, str]], last
         for c in reached:
             st = maps[c.chat_id]
             nxt = next_reached(st, key) if key != STAGE_PARTNER else None
-            if nxt:
+            if nxt and nxt >= st[key]:  # наступну тему надіслали раніше (зміна курсу) — не рахуємо
                 durations.append((nxt - st[key]).total_seconds() / 86400)
-            if STAGE_BONUS in st:
+            if STAGE_BONUS in st and st[key] >= st[STAGE_BONUS]:
                 from_bonus.append((st[key] - st[STAGE_BONUS]).total_seconds() / 86400)
         now_here = sum(1 for c in cohort if current_stage(maps[c.chat_id]) == key)
         lost_here = sum(1 for c in cohort if lost_now[c.chat_id] and lost_now[c.chat_id][0] == key)
@@ -247,12 +303,25 @@ def build_course_efficiency(clients, all_stored: dict[int, dict[str, str]], last
              _d(topic_at, tz) if topic_at else "", silent, chat_url(c.chat_id, c.username), "", "", "",
              "новий (бонус)" if c.client_type == "новий" else "старий"])
 
-    # Старі клієнти на курсі
-    old_on_course = [c for c in active if c not in cohort and any(k in maps[c.chat_id] for k in TOPIC_BY_KEY)]
+    # Усі версії курсу: скільки дійшли до кожної теми
     add([])
-    add(["👥 Старі клієнти, які теж отримують теми"], "section")
-    add(["Кількість", len(old_on_course), "", "", "", "", "", "", "",
-         "Не входять у воронку вище; їхні етапи — у вкладці «Етапи клієнтів»"])
+    add(["📚 Усі версії курсу: скільки людей дійшли до теми"], "section")
+    labels = [label for _, _, label in COURSE_VERSIONS]
+    add(["Тема", *labels, *[""] * (COURSE_WIDTH - 2 - len(labels)), "Порівняння версій — де курс «тримає» краще"],
+        "colheader")
+    by_version = {label: [c for c in active if versions[c.chat_id] and versions[c.chat_id][1] == label]
+                  for label in labels}
+    add(["Почали курс", *[len(by_version[label]) for label in labels]])
+    for t in TOPICS:
+        cells = []
+        for start, count, label in COURSE_VERSIONS:
+            group = by_version[label]
+            if TOPIC_NUMBER.get(t.key, 0) > count or (t.key in OPTIONAL_TOPICS and count > 11):
+                cells.append("—")
+                continue
+            n = sum(1 for c in group if t.key in maps[c.chat_id])
+            cells.append(f"{n} ({round(100 * n / len(group))}%)" if group else 0)
+        add([t.label, *cells])
     return rep
 
 
@@ -286,6 +355,8 @@ def course_check(curator_texts: list[tuple[int, str, str]], tz: ZoneInfo, top: i
         if not ids:
             continue
         with_yt += 1
+        if topic_from_header(text):
+            continue  # підписані «Тема N» відео вже враховані
         for vid in ids:
             if vid in known_ids:
                 continue
@@ -303,14 +374,15 @@ def course_check(curator_texts: list[tuple[int, str, str]], tz: ZoneInfo, top: i
     if not unknown:
         lines.append("Невідомих відео немає ✅")
     else:
-        lines.append(f"<b>Невідомі відео</b> (бот не знає, яка це тема) — топ {min(top, len(unknown))} з {len(unknown)}:")
+        lines.append(f"<b>Відео без підпису «Тема N»</b> (бот не вважає їх темами) — топ {min(top, len(unknown))} "
+                     f"з {len(unknown)}:")
         for vid, (n, chats, first, last, sample) in sorted(unknown.items(), key=lambda x: -x[1][0])[:top]:
             d1 = datetime.fromisoformat(first).astimezone(tz).strftime("%d.%m.%y")
             d2 = datetime.fromisoformat(last).astimezone(tz).strftime("%d.%m.%y")
             snippet = " ".join(sample.split())[:70]
             lines.append(f"• <code>{vid}</code> — {n} раз, {len(chats)} клієнтам, {d1}–{d2}\n   «{_html(snippet)}»")
         lines.append("")
-        lines.append("Напишіть, яка тема кожне з цих відео — я додам їх, і бот перерахує етапи.")
+        lines.append("Здебільшого це зуми й новини. Якщо якесь із них — тема курсу, напишіть яка, і я додам.")
     return "\n".join(lines)
 
 

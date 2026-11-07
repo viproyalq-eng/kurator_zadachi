@@ -247,7 +247,7 @@ class SheetWriter:
                 ws = ss.worksheet(next(t for t in OLD_STATS_TABS if t in titles))
                 ss.batch_update({"requests": [{"updateSheetProperties": {
                     "properties": {"sheetId": ws.id, "title": STATS_TAB}, "fields": "title"}}]})
-                ws.title = STATS_TAB
+                ws = ss.worksheet(STATS_TAB)  # перечитуємо вкладку вже з новою назвою
             else:
                 ws = ss.add_worksheet(title=STATS_TAB, rows=max(160, len(grid) + 10), cols=20)
             if ws.row_count < len(grid) + 5:

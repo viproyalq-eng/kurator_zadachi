@@ -5,18 +5,31 @@ from bot.sheets import (CLIENTS_HEADER, CLIENTS_TAB, MESSAGES_HEADER, MESSAGES_T
 
 
 class FakeWS:
+    """Як справжній gspread.Worksheet: title, id і row_count лише для читання."""
     _next_id = 1
-    row_count = 1000
-
-    def add_rows(self, n):
-        self.row_count += n
 
     def __init__(self, title):
-        self.id = FakeWS._next_id
+        self._id = FakeWS._next_id
         FakeWS._next_id += 1
-        self.title = title
+        self._title = title
+        self._row_count = 1000
         self.rows = []
         self.fail = False
+
+    @property
+    def title(self):
+        return self._title
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def row_count(self):
+        return self._row_count
+
+    def add_rows(self, n):
+        self._row_count += n
 
     def row_values(self, n):
         return self.rows[n - 1] if len(self.rows) >= n else []
@@ -241,6 +254,11 @@ def _chart_api(ss):
     def batch_update(body):
         batches.append(body)
         for r in body["requests"]:
+            if "updateSheetProperties" in r:          # як Google: перейменовує вкладку
+                props = r["updateSheetProperties"]["properties"]
+                for ws in ss.tabs.values():
+                    if ws.id == props["sheetId"]:
+                        ws._title = props["title"]
             if "addChart" in r:
                 sid = r["addChart"]["chart"]["position"]["overlayPosition"]["anchorCell"]["sheetId"]
                 charts.setdefault(sid, []).append(r["addChart"]["chart"]["spec"]["title"])
@@ -266,11 +284,12 @@ def test_old_statistics_tab_is_renamed_and_only_new_charts_added(writer):
     w, ss = writer
     batches, charts = _chart_api(ss)
     old = ss.add_worksheet("Статистика", 60, 20)
-    old.row_count = 60
+    old._row_count = 60
     charts[old.id] = [t for t, _, _ in chart_specs(old.id)[:3]]   # три старі діаграми вже є
     w.write_stats([["x"]] * 120)
     renames = [r for b in batches for r in b["requests"] if "updateSheetProperties" in r]
     assert renames and renames[0]["updateSheetProperties"]["properties"]["title"] == "Діаграми ефективності"
+    assert old.title == "Діаграми ефективності" and old.rows[0] == ["x"]
     assert old.row_count >= 125                        # рядків вистачає для трендів
     assert len(charts[old.id]) == 9                    # додано лише 6 нових, без дублів
 

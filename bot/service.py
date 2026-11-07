@@ -12,7 +12,8 @@ from typing import Awaitable, Callable
 from .config import Config
 from .db import CLIENT_NEW, CLIENT_OLD, STATUS_INVESTOR, STATUS_PARTNER, Client, Database, Scheduled, Task
 from .logic import SENDER_BOT, SENDER_CLIENT, fmt_dt, is_bonus
-from .course import STAGE_BONUS, TOPIC_BY_KEY, detect_topics, latest_topic
+from .course import (STAGE_BONUS, STAGE_PACK, TOPIC_BY_KEY, checklist_done, detect_topics, is_course_pack,
+                     latest_topic)
 from .schedule import in_send_window, next_send_time, reply_deadline
 from .texts import LOST_AFTER_DAYS, LOST_MAX_DAYS, LOST_TOPIC_MAX_DAYS
 from .tasks import chat_url, cutoff_utc, person_link, task_row
@@ -164,9 +165,12 @@ class BotService:
             for task in self.db.mark_tasks_done(client.chat_id, msg.date.isoformat(), msg.text):
                 self._queue_task(task)
             self.db.cancel_scheduled(client.chat_id, (KIND_WELCOME, KIND_REMINDER))
-            topics = detect_topics(msg.text)
-            if topics:
-                self._apply_topics(client, topics, msg.date)
+            if self._record_course(client.chat_id, msg.text, msg.date):
+                self._refresh_client_stage(client)
+                self.stages_dirty = True
+            for key in checklist_done(msg.text):
+                self.db.record_stage_if_missing(client.chat_id, key, msg.date.isoformat())
+                self.stages_dirty = True
             if self.db.get_setting(ROUND_START_KEY):
                 await self.maybe_finish_round(self._now())
         elif sender == SENDER_CLIENT:
@@ -188,6 +192,21 @@ class BotService:
             self.db.record_stage(client.chat_id, STAGE_BONUS, msg.date.isoformat())
             self.stages_dirty = True
             await self._start_welcome(client, msg.date)
+
+    async def handle_edit(self, msg: IncomingMessage) -> None:
+        """Віктор відредагував повідомлення (напр. поставив ✅ у закріпленому списку тем)."""
+        self.db.update_message_text(msg.chat_id, msg.message_id, msg.text)
+        owner_id = await self._owner_id(msg.business_connection_id)
+        if msg.sent_by_bot or owner_id is None or msg.from_user_id != owner_id:
+            return
+        now = self._now()
+        added = [k for k in checklist_done(msg.text)
+                 if self.db.record_stage_if_missing(msg.chat_id, k, now.isoformat())]
+        if added:
+            client = self.db.get_client(msg.chat_id)
+            if client:
+                self._refresh_client_stage(client)
+            self.stages_dirty = True
 
     # --- курс інвестора: етапи ---
     def _apply_topics(self, client: Client, keys: list[str], at: datetime) -> None:
@@ -212,15 +231,33 @@ class BotService:
         self._queue_client(client)
         return True
 
+    def _record_course(self, chat_id: int, text: str | None, at: datetime) -> bool:
+        """Видача теми («Тема N…» / відео) або курс 2024 одним повідомленням. Повертає, чи щось знайдено."""
+        found = False
+        for key in detect_topics(text):
+            self.db.record_stage(chat_id, key, at.isoformat())
+            found = True
+        if is_course_pack(text):
+            self.db.record_stage(chat_id, STAGE_PACK, at.isoformat())
+            found = True
+        return found
+
     def rescan_course_history(self) -> int:
         """Шукає теми курсу в усій збереженій історії (і імпортованій). Повертає, скільки клієнтів оновлено."""
         touched: set[int] = set()
+        checklists = []
         for chat_id, date, text in self.db.curator_texts(self.cfg.curator_name):
             low = text.lower()
-            if "youtu" not in low and not any(p for t in TOPIC_BY_KEY.values() for p in t.phrases if p in low):
+            if ("youtu" not in low and "тема" not in low and "курс" not in low
+                    and not any(p for t in TOPIC_BY_KEY.values() for p in t.phrases if p in low)):
                 continue
-            for key in detect_topics(text):
-                self.db.record_stage(chat_id, key, date)
+            if self._record_course(chat_id, text, datetime.fromisoformat(date)):
+                touched.add(chat_id)
+            if checklist_done(text):
+                checklists.append((chat_id, date, text))
+        for chat_id, date, text in checklists:
+            for key in checklist_done(text):
+                self.db.record_stage_if_missing(chat_id, key, date)
                 touched.add(chat_id)
         updated = 0
         for chat_id in touched:
@@ -552,11 +589,17 @@ class BotService:
         self.db.exclude_usernames(self.cfg.team_usernames)
         for chat in export.chats:
             # Теми курсу шукаємо в усіх повідомленнях Віктора з файлу (навіть новіших за запуск бота).
+            checklists = []
             for m in chat.messages:
                 if m.from_owner:
-                    for key in detect_topics(m.text):
-                        self.db.record_stage(chat.chat_id, key, m.date.isoformat())
+                    if self._record_course(chat.chat_id, m.text, m.date):
                         report.course_clients.add(chat.chat_id)
+                    if checklist_done(m.text):
+                        checklists.append(m)
+            for m in checklists:  # ✅ у списку тем — після підписів, щоб не перебити точні дати
+                for key in checklist_done(m.text):
+                    self.db.record_stage_if_missing(chat.chat_id, key, (m.edited or m.date).isoformat())
+                    report.course_clients.add(chat.chat_id)
             msgs = [m for m in chat.messages if before is None or m.date < before]
             if not msgs:
                 continue

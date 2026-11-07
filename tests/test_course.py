@@ -280,3 +280,53 @@ async def test_old_dropout_with_recent_touch_is_not_lost(tmp_path):
     await e.say("v", TOPIC_TEXT["t4"], day(0))
     await e.say("v", "Привіт 👋 Як ваші справи з роботом?", day(27))
     assert await e.service.check_lost(day(30)) == 0
+
+
+CHECKLIST = ("🧑‍🎓 КУРС ИНВЕСТОРА:\n\n✅Тема 1: Статистика\n✅Тема 2: Интерфейс \n⬛️Тема 3: Как работает стратегия?\n"
+             "⬛️Тема 4: Сколько денег нужно\n⬛️Тема 5: Доступ в клуб")
+PACK = ('📚КУРС ИНВЕСТОРА от 20.09.2024 (добавлен урок 13)\n✅УРОК1 - ИНТЕРФЕЙС\n➖➖\n✅УРОК2 - ДЕНЬГИ ЛЮБЯТ СЧЕТ\n'
+        '✅УРОК3 - ЗАЧЕМ ТЫ СЮДА ПРИШЕЛ?\n✅УРОК4 - КАК РАБОТАЕТ СТРАТЕГИЯ?')
+
+
+def test_checklist_and_pack_detection():
+    from bot.course import checklist_done, is_course_pack
+    assert detect_topics(CHECKLIST) == [] and checklist_done(CHECKLIST) == ["t1", "t2"]
+    assert is_course_pack(PACK) and detect_topics(PACK) == [] and not is_course_pack(CHECKLIST)
+    assert detect_topics("Привіт ) Тема 7 - Цель инвестора 🍄Видео - https://youtu.be/yz2bM-g8m-A") == ["t7"]
+    assert detect_topics("Передал твой ник ассистенту 🤝 Следующую тему: 💡 Тема №5 - Маркетинг план") == ["t5"]
+    for question in ("Вам уже удалось пройти тему 2?", "Видавати тему 6?", "Новое видео(тема4) добавлено",
+                     "сейчас я напротив темы 1 - поставлю галочку"):
+        assert detect_topics(question) == []
+
+
+async def test_checklist_ticks_do_not_override_exact_dates(tmp_path):
+    e = Env(tmp_path)
+    await e.say("v", CHECKLIST.replace("✅", "⬛️"), day(0))         # список надіслано без галочок
+    await e.say("v", TOPIC_TEXT["t1"], day(1))                        # тема 1 видана з підписом
+    rows = [(CLIENT, 50, None, "Віктор", CHECKLIST, day(0).isoformat())]  # у файлі — вже з галочками
+    e.db.add_messages_bulk(rows)
+    e.service.rescan_course_history()
+    stages = e.db.stages_of(CLIENT)
+    assert stages["t1"] == day(1).isoformat()          # точна дата з «Тема 1», а не дата списку
+    assert stages["t2"] == day(0).isoformat()          # тема 2 відома лише з ✅
+
+
+async def test_live_tick_in_pinned_list(tmp_path):
+    e = Env(tmp_path)
+    await e.say("v", CHECKLIST.replace("✅", "⬛️"), day(0))
+    mid = e.mid
+    e.now = day(2)
+    await e.service.handle_edit(IncomingMessage("conn", CLIENT, mid, day(0), VIKTOR, False, "Іван", "ivan",
+                                                CHECKLIST))
+    stages = e.db.stages_of(CLIENT)
+    assert stages["t1"] == day(2).isoformat() and stages["t2"] == day(2).isoformat() and "t3" not in stages
+    assert e.service.stages_dirty
+
+
+async def test_course_pack_2024(tmp_path):
+    e = Env(tmp_path)
+    await e.say("v", PACK, day(0))
+    row = dict(zip(stages_header(), stages_rows(e.db.all_clients(), e.db.all_stages(), {}, KYIV)[0]))
+    assert row["Версія курсу"] == "2024 (весь курс одним повідомленням)"
+    assert row["Курс 2024 (одним повідомленням)"].startswith("✅") and row["Тема 1"] == "—"
+    assert row["Тем отримано"] == "весь курс одразу"

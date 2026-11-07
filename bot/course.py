@@ -40,16 +40,54 @@ _HEADER = re.compile(r"^\W{0,8}(?:под)?тема\s*(\d{1,2})(?:\s*[.,]\s*(?:ч
 
 
 _SUBTOPIC = re.compile(r"\bподтема\s*(\d{1,2})(?:\s*[.,]\s*(\d))?", re.I)
+# «Привіт ) Тема 7 - Цель…», «Следующую тему: 💡 Тема №5 - Маркетинг» — підпис посеред тексту, але з «:» / «-»
+_INLINE = re.compile(r"(?<![\w(])тема\s*№?\s*(\d{1,2})(?:\s*[.,]\s*(?:часть|ч\.?)?\s*(\d))?\s*[:\-–—]", re.I)
+_ANY_TOPIC = re.compile(r"(?<![\w(])тема\s*№?\s*\d{1,2}", re.I)
+# Список тем із позначками: «✅Тема 1: … ⬛️Тема 2: …» (Віктор ставить ✅ напроти пройдених)
+_CHECK_ITEM = re.compile(r"(✅|☑️|✔️|⬛️|⬛|⬜️|⬜|◻️|▪️)?\s*тема\s*№?\s*(\d{1,2})(?:\s*[.,]\s*(?:часть|ч\.?)?\s*(\d))?",
+                         re.I)
+_DONE_MARKS = {"✅", "☑️", "✔️"}
+_PACK_LESSON = re.compile(r"урок\s*#?\s*\d", re.I)
+
+
+def _key_for(n: int, part: int | None) -> str | None:
+    return TOPIC_BY_NUMBER.get((n, part)) or TOPIC_BY_NUMBER.get((n, None)) or TOPIC_BY_NUMBER.get((n, 1))
+
+
+def is_checklist(text: str | None) -> bool:
+    """Список усіх тем курсу (а не видача однієї теми)."""
+    return len(_ANY_TOPIC.findall(text or "")) >= 3
+
+
+def checklist_done(text: str | None) -> list[str]:
+    """Теми, позначені ✅ у списку тем."""
+    if not is_checklist(text):
+        return []
+    keys = []
+    for mark, n, part in _CHECK_ITEM.findall(text or ""):
+        key = _key_for(int(n), int(part) if part else None)
+        if mark in _DONE_MARKS and key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def is_course_pack(text: str | None) -> bool:
+    """Курс 2024 року: «КУРС ИНВЕСТОРА … УРОК1 … УРОК2 …» — усі уроки одним повідомленням."""
+    t = text or ""
+    return "курс инвестора" in t.lower() and len(_PACK_LESSON.findall(t)) >= 3 and not is_checklist(t)
 
 
 def topic_from_header(text: str | None) -> str | None:
     flat = " ".join((text or "").split())
-    m = _HEADER.match(flat) or _SUBTOPIC.search(flat[:60])  # «Очень важная подтема 4.2 …»
+    if is_checklist(flat):
+        return None  # список тем — це не видача теми
+    m = _HEADER.match(flat) or _SUBTOPIC.search(flat[:60]) or _INLINE.search(flat)
     if not m:
         return None
-    n, part = int(m.group(1)), int(m.group(2)) if m.group(2) else None
-    return (TOPIC_BY_NUMBER.get((n, part)) or TOPIC_BY_NUMBER.get((n, None))
-            or TOPIC_BY_NUMBER.get((n, 1)))
+    return _key_for(int(m.group(1)), int(m.group(2)) if m.group(2) else None)
+
+
+PACK_VERSION = (0, "2024 (весь курс одним повідомленням)")
 
 
 def course_version(first_topic_at: datetime | None) -> tuple[int, str] | None:
@@ -65,10 +103,12 @@ def course_version(first_topic_at: datetime | None) -> tuple[int, str] | None:
 
 # Усі етапи по порядку. «Партнер» куратор ставить вручну (/partner).
 STAGE_BONUS, STAGE_WELCOME, STAGE_WELCOME_REPLY, STAGE_PARTNER = "bonus", "welcome", "welcome_reply", "partner"
+STAGE_PACK = "course_pack"   # курс 2024 року: усі уроки одним повідомленням
 STAGES: list[tuple[str, str]] = [
     (STAGE_BONUS, "Написав «бонус»"),
     (STAGE_WELCOME, "Привітання надіслано"),
     (STAGE_WELCOME_REPLY, "Відповів на привітання"),
+    (STAGE_PACK, "Курс 2024 (одним повідомленням)"),
     *[(t.key, t.label) for t in TOPICS],
     (STAGE_PARTNER, "Партнер"),
 ]
@@ -84,6 +124,8 @@ def detect_topics(text: str | None) -> list[str]:
     by_header = topic_from_header(text)
     if by_header:
         return [by_header]
+    if is_checklist(text) or is_course_pack(text):
+        return []  # списки тем і курс 2024 обробляються окремо
     ids = set(_YT_ID.findall(text))
     norm = _norm(text)
     found = []
@@ -149,7 +191,8 @@ def active_lost(stored: dict[str, str], last_client_msg: str | None) -> tuple[st
 def stages_header() -> list[str]:
     return ["Клієнт", "Username", "ID чату", "Тип", "Версія курсу", "Тем отримано", "Поточний етап", "Етап з",
             "Пропав після",
-            "Бонус", "Привітання", "Відповів", *[t.label for t in TOPICS], "Партнер", "Посилання на чат"]
+            "Бонус", "Привітання", "Відповів", "Курс 2024 (одним повідомленням)", *[t.label for t in TOPICS], "Партнер",
+            "Посилання на чат"]
 
 
 def stages_rows(clients, all_stored: dict[int, dict[str, str]], last_client: dict[int, str | None],
@@ -162,11 +205,13 @@ def stages_rows(clients, all_stored: dict[int, dict[str, str]], last_client: dic
             continue
         stored = all_stored.get(c.chat_id, {})
         st = stage_map(c, stored)
-        if not any(k in st for k in (STAGE_BONUS, STAGE_WELCOME, *TOPIC_BY_KEY)):
+        if not any(k in st for k in (STAGE_BONUS, STAGE_WELCOME, STAGE_PACK, *TOPIC_BY_KEY)):
             continue
         cur = current_stage(st)
         topic_dates = [st[t.key] for t in TOPICS if t.key in st]
         version = course_version(min(topic_dates) if topic_dates else None)
+        if version is None and STAGE_PACK in st:
+            version = PACK_VERSION
         in_version = [t for t in TOPICS if version is None or TOPIC_NUMBER.get(t.key, 0) <= version[0]]
         topics_got = sum(1 for t in TOPICS if t.key in st)
         last_key = latest_topic(st)
@@ -175,6 +220,8 @@ def stages_rows(clients, all_stored: dict[int, dict[str, str]], last_client: dic
         def cell(key: str) -> str:
             if key in st:
                 return f"{MARK_DONE} {_d(st[key], tz)}"
+            if key in TOPIC_BY_KEY and version == PACK_VERSION:
+                return "—"  # курс 2024 — без окремих тем
             if key in TOPIC_BY_KEY and version and TOPIC_NUMBER.get(key, 0) > version[0]:
                 return "—"  # у версії курсу клієнта такої теми не було
             if key in OPTIONAL_TOPICS and version and version[0] > 11:
@@ -183,17 +230,21 @@ def stages_rows(clients, all_stored: dict[int, dict[str, str]], last_client: dic
                 return MARK_SKIPPED
             if key in (STAGE_BONUS, STAGE_WELCOME, STAGE_WELCOME_REPLY) and c.client_type != "новий":
                 return "—"  # старий клієнт не писав «бонус»
+            if key == STAGE_PACK:
+                return "—"
             return MARK_TODO
 
         rows.append((STAGE_INDEX.get(cur, -1), st.get(cur).isoformat() if cur else "", [
             c.name or "Без імені", f"@{c.username}" if c.username else "", str(c.chat_id), c.client_type,
             version[1] if version else "—",
-            f"{topics_got} з {len(in_version) - (1 if version and version[0] > 11 else 0)}",
+            ("весь курс одразу" if version == PACK_VERSION else
+             f"{topics_got} з {len(in_version) - (1 if version and version[0] > 11 else 0)}"),
             STAGE_LABELS.get(cur, "—") if cur else "—",
             _d(st[cur], tz) if cur else "",
             f"⚠️ {TOPIC_BY_KEY[lost[0]].label if lost[0] in TOPIC_BY_KEY else lost[0]} ({_d(datetime.fromisoformat(lost[1]), tz)})"
             if lost else "",
-            cell(STAGE_BONUS), cell(STAGE_WELCOME), cell(STAGE_WELCOME_REPLY), *[cell(t.key) for t in TOPICS],
+            cell(STAGE_BONUS), cell(STAGE_WELCOME), cell(STAGE_WELCOME_REPLY), cell(STAGE_PACK),
+            *[cell(t.key) for t in TOPICS],
             f"{MARK_DONE} {_d(st[STAGE_PARTNER], tz)}" if STAGE_PARTNER in st else "",
             chat_url(c.chat_id, c.username),
         ]))
@@ -312,6 +363,9 @@ def build_course_efficiency(clients, all_stored: dict[int, dict[str, str]], last
     by_version = {label: [c for c in active if versions[c.chat_id] and versions[c.chat_id][1] == label]
                   for label in labels}
     add(["Почали курс", *[len(by_version[label]) for label in labels]])
+    pack_n = sum(1 for c in active if STAGE_PACK in maps[c.chat_id])
+    add(["Курс 2024 (одним повідомленням)", pack_n, "", "", "", "", "", "", "",
+         "Тоді весь курс видавали одразу — по темах не відстежується"])
     for t in TOPICS:
         cells = []
         for start, count, label in COURSE_VERSIONS:

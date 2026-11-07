@@ -515,6 +515,17 @@ class Database:
         self.conn.commit()
         return not existed
 
+    def record_stage_if_missing(self, chat_id: int, stage: str, at_iso: str) -> bool:
+        """Лише якщо етапу ще немає (для ✅ у списку тем: точну дату дає підпис «Тема N», якщо він є)."""
+        cur = self.conn.execute("INSERT OR IGNORE INTO client_stages (chat_id, stage, at) VALUES (?, ?, ?)",
+                                (chat_id, stage, at_iso))
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def update_message_text(self, chat_id: int, message_id: int, text: str) -> None:
+        self.conn.execute("UPDATE messages SET text=? WHERE chat_id=? AND message_id=?", (text, chat_id, message_id))
+        self.conn.commit()
+
     def stages_of(self, chat_id: int) -> dict[str, str]:
         return {r[0]: r[1] for r in self.conn.execute("SELECT stage, at FROM client_stages WHERE chat_id=?", (chat_id,))}
 

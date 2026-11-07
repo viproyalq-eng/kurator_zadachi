@@ -34,6 +34,7 @@ class ExportMessage:
     date: datetime          # UTC
     from_owner: bool        # написав власник акаунта (Віктор)
     text: str
+    edited: datetime | None = None   # коли востаннє редагували (напр. поставили ✅ у списку тем)
 
 
 @dataclass
@@ -180,7 +181,13 @@ def parse_export(data: dict, tz: ZoneInfo, fallback_owner_id: int | None = None)
                 from_owner = sender == owner
             else:
                 from_owner = sender is not None and sender != chat_id
-            out.messages.append(ExportMessage(m["id"], date, from_owner, _message_text(m)))
+            edited = None
+            if m.get("edited_unixtime"):
+                try:
+                    edited = datetime.fromtimestamp(int(m["edited_unixtime"]), timezone.utc)
+                except (TypeError, ValueError):
+                    edited = None
+            out.messages.append(ExportMessage(m["id"], date, from_owner, _message_text(m), edited))
         if out.messages:
             export.chats.append(out)
         else:

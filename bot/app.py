@@ -400,6 +400,7 @@ class BotApp:
         app = self.application
         app.add_handler(BusinessConnectionHandler(self.on_business_connection))
         app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, self.on_business_message))
+        app.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, self.on_business_edit))
         app.add_handler(CommandHandler("start", self.cmd_start, filters=PRIVATE_ONLY))
         app.add_handler(CommandHandler("id", self.cmd_id, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("chatid", self.cmd_chatid, filters=filters.UpdateType.MESSAGE))
@@ -438,6 +439,12 @@ class BotApp:
         if message is None or message.chat.type != "private":
             return
         await self.service.handle_message(incoming_from_tg(message))
+
+    async def on_business_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.edited_business_message
+        if message is None or message.chat.type != "private":
+            return
+        await self.service.handle_edit(incoming_from_tg(message))
 
     async def on_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Бота додали в групу або вилучили з неї — повідомляємо адмінів разом з ID групи."""

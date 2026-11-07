@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
@@ -53,6 +54,23 @@ class IncomingMessage:
 SendFn = Callable[[str, int, str], Awaitable[tuple[int, datetime]]]
 # Дізнається, хто власник бізнес-підключення (user_id), якщо його ще немає в базі.
 OwnerFn = Callable[[str], Awaitable[int | None]]
+
+
+_CHAT_LINK = re.compile(r"(?:web\.telegram\.org/[a-z]/#|tg://user\?id=|tg://openmessage\?user_id=)(-?\d+)",
+                        re.IGNORECASE)
+_USERNAME_LINK = re.compile(r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})/?$", re.IGNORECASE)
+
+
+def _chat_id_from_link(token: str) -> int | None:
+    m = _CHAT_LINK.search(token)
+    return int(m.group(1)) if m else None
+
+
+def _username_from_link(token: str) -> str | None:
+    if token.startswith("@") and len(token) > 1:
+        return token[1:]
+    m = _USERNAME_LINK.match(token)
+    return m.group(1) if m else None
 
 
 @dataclass
@@ -145,6 +163,11 @@ class BotService:
             if (client.welcome_sent_at and not client.welcome_replied_at
                     and msg.date.isoformat() >= client.welcome_sent_at):
                 await self._on_welcome_reply(client, msg)
+            if (client.cold_since and self.notify_group
+                    and self.db.client_messages_after(client.chat_id, SENDER_CLIENT, client.cold_since) == 1):
+                await self.notify_group(
+                    f"❄️ Холодний клієнт {person_link(client.chat_id, client.name, client.username)} написав сам:\n"
+                    f"«{html.escape((msg.text or '')[:400])}»\n\nЯкщо варто знову вести — /warm")
 
         if wants_welcome:
             await self._start_welcome(client, msg.date)
@@ -201,7 +224,7 @@ class BotService:
         if client is None:
             self.db.update_scheduled(sched.id, status="cancelled")
             return
-        if sched.kind == KIND_REMINDER and client.welcome_replied_at:
+        if (sched.kind == KIND_REMINDER and client.welcome_replied_at) or client.cold_since:
             self.db.update_scheduled(sched.id, status="cancelled")
             return
         deadline = datetime.fromisoformat(sched.deadline_at)
@@ -276,7 +299,7 @@ class BotService:
             for sched in self.db.scheduled(status="missed"):
                 client = self.db.get_client(sched.chat_id)
                 self.db.update_scheduled(sched.id, status="tasked")
-                if client is None or client.excluded or client.chat_id in taken:
+                if client is None or client.excluded or client.cold_since or client.chat_id in taken:
                     continue
                 if client.welcome_replied_at or self.db.curator_wrote_after(
                         client.chat_id, self.cfg.curator_name, sched.created_at):
@@ -377,6 +400,58 @@ class BotService:
         found.sort(key=lambda c: c.last_message_at or "", reverse=True)
         return found[:limit]
 
+    def set_cold(self, chat_id: int, cold: bool, now_utc: datetime) -> tuple[Client | None, bool]:
+        """Перенести в «холодні» (або повернути). Повертає (клієнт, чи змінилося)."""
+        before = self.db.get_client(chat_id)
+        if before is None:
+            return None, False
+        if bool(before.cold_since) == cold:
+            return before, False
+        client = self.db.set_cold(chat_id, now_utc.isoformat() if cold else None)
+        if cold:
+            # холодним бот нічого не надсилає
+            self.db.cancel_scheduled(chat_id, (KIND_WELCOME, KIND_REMINDER))
+        self._queue_client(client)
+        return client, True
+
+    def resolve_tokens(self, text: str, today_tasks: list[Task]) -> tuple[list[Client], list[str], str]:
+        """Розбирає, кого мав на увазі куратор. Розуміє:
+        - номер зі сьогоднішнього списку задач (3, 7);
+        - @username або посилання t.me/username;
+        - посилання на чат: web.telegram.org/a/#123456789, tg://user?id=…, або сам ID чату;
+        - решта слів — ім'я, як людина підписана (пошук → кнопки).
+        Повертає (точно знайдені, не знайдені, текст для пошуку за іменем)."""
+        from .tasks import ordered_tasks
+        ordered = ordered_tasks(today_tasks)
+        found: list[Client] = []
+        missing: list[str] = []
+        words: list[str] = []
+        for token in re.split(r"[\s,;]+", text.strip()):
+            if not token:
+                continue
+            chat_id = _chat_id_from_link(token)
+            username = None if chat_id is not None else _username_from_link(token)
+            if chat_id is not None:
+                client = self.db.get_client(chat_id)
+                (found.append(client) if client else missing.append(token))
+            elif username:
+                client = self.db.find_by_username(username)
+                (found.append(client) if client else missing.append("@" + username))
+            elif token.isdigit():
+                n = int(token)
+                if n <= 1000:
+                    if 1 <= n <= len(ordered) and (client := self.db.get_client(ordered[n - 1].chat_id)):
+                        found.append(client)
+                    else:
+                        missing.append(f"№{n}")
+                else:  # великі числа — це ID чату
+                    client = self.db.get_client(n)
+                    (found.append(client) if client else missing.append(token))
+            else:
+                words.append(token)
+        unique = list({c.chat_id: c for c in found}.values())
+        return unique, missing, " ".join(words)
+
     def set_status(self, chat_id: int, status: str, now_utc: datetime) -> tuple[Client | None, bool]:
         """Змінює статус. Повертає (клієнт, чи змінився статус)."""
         before = self.db.get_client(chat_id)
@@ -427,4 +502,12 @@ def client_row(client: Client, tz) -> list:
         "так" if client.excluded else "",
         STATUS_LABELS.get(client.status, client.status), _fmt_iso(client.partner_since, tz),
         chat_url(client.chat_id, client.username),
+        _fmt_iso(client.cold_since, tz),
     ]
+
+
+def cold_row(client: Client, tz) -> list:
+    """Рядок вкладки «Холодні»."""
+    return [client.name or "", f"@{client.username}" if client.username else "", str(client.chat_id),
+            _fmt_iso(client.cold_since, tz), _fmt_iso(client.last_message_at, tz), client.last_from or "",
+            STATUS_LABELS.get(client.status, client.status), chat_url(client.chat_id, client.username)]

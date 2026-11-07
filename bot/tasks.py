@@ -78,6 +78,12 @@ TASK_KIND_LABELS = {
 }
 
 
+def ordered_tasks(tasks: list[Task]) -> list[Task]:
+    """Задачі в тому порядку, в якому вони пронумеровані в повідомленні."""
+    order = [kind for kind, _ in TASK_SECTIONS]
+    return [t for kind in order for t in tasks if (t.kind or "stale") == kind]
+
+
 def format_tasks_message(task_date: str, tasks: list[Task], now_utc: datetime, min_days: int,
                          yesterday: tuple[int, int] | None = None, header: str | None = None,
                          tz: ZoneInfo = ZoneInfo("Europe/Kyiv")) -> str:
@@ -90,6 +96,7 @@ def format_tasks_message(task_date: str, tasks: list[Task], now_utc: datetime, m
         lines.append(f"Сьогодні немає клієнтів, з якими не спілкувалися {min_days}+ днів 🎉")
         return "\n".join(lines)
     number = 0
+    tasks = ordered_tasks(tasks)
     for kind, title in TASK_SECTIONS:
         section = [t for t in tasks if (t.kind or "stale") == kind]
         if not section:
@@ -107,7 +114,8 @@ def format_tasks_message(task_date: str, tasks: list[Task], now_utc: datetime, m
     done = sum(1 for t in tasks if t.done_at)
     if done:
         lines.append(f"Виконано: {done} з {len(tasks)}")
-    lines.append("Задача виконана, щойно Віктор напише клієнту будь-яке повідомлення.")
+    lines.append("Задача виконана, щойно Віктор напише клієнту будь-яке повідомлення.\n"
+                 "Більше не вести когось: /cold і номери, наприклад /cold 3 7")
     return "\n".join(lines)
 
 

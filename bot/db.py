@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS clients (
     status TEXT NOT NULL DEFAULT 'інвестор',
     partner_since TEXT,
     welcome_replied_at TEXT,
-    reminder_sent_at TEXT
+    reminder_sent_at TEXT,
+    cold_since TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -105,6 +106,7 @@ class Client:
     partner_since: str | None = None
     welcome_replied_at: str | None = None   # клієнт відповів після привітання
     reminder_sent_at: str | None = None     # бот надіслав нагадування
+    cold_since: str | None = None           # «холодний»: без задач і без повідомлень бота
 
 
 @dataclass
@@ -166,7 +168,7 @@ class Database:
             self.conn.execute("ALTER TABLE clients ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
         if "status" not in cols:
             self.conn.execute(f"ALTER TABLE clients ADD COLUMN status TEXT NOT NULL DEFAULT '{STATUS_INVESTOR}'")
-        for col in ("partner_since", "welcome_replied_at", "reminder_sent_at"):
+        for col in ("partner_since", "welcome_replied_at", "reminder_sent_at", "cold_since"):
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE clients ADD COLUMN {col} TEXT")
         task_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(tasks)")}
@@ -207,7 +209,7 @@ class Database:
         return Client(**dict(row)) if row else None
 
     def upsert_client(self, client: Client) -> None:
-        # status і partner_since змінюються лише через set_status — тут їх не перезаписуємо.
+        # status, partner_since і cold_since змінюються лише окремими командами — тут їх не перезаписуємо.
         self.conn.execute(
             """INSERT INTO clients (chat_id, business_connection_id, name, username, client_type, first_seen,
                                     last_message_at, last_from, welcome_sent_at, stage, excluded,
@@ -222,7 +224,7 @@ class Database:
                  welcome_sent_at=excluded.welcome_sent_at, stage=excluded.stage,
                  excluded=excluded.excluded, welcome_replied_at=excluded.welcome_replied_at,
                  reminder_sent_at=excluded.reminder_sent_at""",
-            {k: v for k, v in client.__dict__.items() if k not in ("status", "partner_since")},
+            {k: v for k, v in client.__dict__.items() if k not in ("status", "partner_since", "cold_since")},
         )
         self.conn.commit()
 
@@ -235,6 +237,25 @@ class Database:
                WHERE chat_id=?""", (status, status, partner_since, chat_id))
         self.conn.commit()
         return self.get_client(chat_id)
+
+    def set_cold(self, chat_id: int, cold_iso: str | None) -> Client | None:
+        """cold_iso — дата переносу в холодні; None — повернути з холодних."""
+        self.conn.execute("UPDATE clients SET cold_since=? WHERE chat_id=?", (cold_iso, chat_id))
+        self.conn.commit()
+        return self.get_client(chat_id)
+
+    def cold_clients(self) -> list[Client]:
+        rows = self.conn.execute("SELECT * FROM clients WHERE cold_since IS NOT NULL ORDER BY cold_since DESC")
+        return [Client(**dict(r)) for r in rows]
+
+    def find_by_username(self, username: str) -> Client | None:
+        row = self.conn.execute("SELECT * FROM clients WHERE lower(username)=?",
+                                (username.lstrip("@").lower(),)).fetchone()
+        return Client(**dict(row)) if row else None
+
+    def client_messages_after(self, chat_id: int, client_sender: str, after_iso: str) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM messages WHERE chat_id=? AND sender=? AND date > ?",
+                                 (chat_id, client_sender, after_iso)).fetchone()[0]
 
     def all_clients(self, include_excluded: bool = False) -> list[Client]:
         sql = "SELECT * FROM clients" + ("" if include_excluded else " WHERE excluded=0")
@@ -272,7 +293,7 @@ class Database:
         """Клієнти, з якими не було жодного повідомлення з моменту cutoff — найстаріші першими."""
         rows = self.conn.execute(
             """SELECT * FROM clients
-               WHERE excluded=0 AND last_message_at IS NOT NULL AND last_message_at <= ?
+               WHERE excluded=0 AND cold_since IS NULL AND last_message_at IS NOT NULL AND last_message_at <= ?
                ORDER BY last_message_at ASC LIMIT ?""", (cutoff_iso, limit)).fetchall()
         return [Client(**dict(r)) for r in rows]
 
@@ -352,7 +373,7 @@ class Database:
     def silent_after_reminder(self, sent_before_iso: str) -> list[Client]:
         """Клієнти, яким надіслано нагадування (до вказаного часу), але вони так і не відповіли."""
         rows = self.conn.execute(
-            """SELECT * FROM clients WHERE excluded=0 AND reminder_sent_at IS NOT NULL
+            """SELECT * FROM clients WHERE excluded=0 AND cold_since IS NULL AND reminder_sent_at IS NOT NULL
                AND reminder_sent_at < ? AND welcome_replied_at IS NULL""", (sent_before_iso,))
         return [Client(**dict(r)) for r in rows]
 
@@ -435,4 +456,5 @@ class Database:
             "welcomes": q("SELECT COUNT(*) FROM clients WHERE welcome_sent_at IS NOT NULL"),
             "excluded": q("SELECT COUNT(*) FROM clients WHERE excluded=1"),
             "partners": q(f"SELECT COUNT(*) FROM clients WHERE excluded=0 AND status='{STATUS_PARTNER}'"),
+            "cold": q("SELECT COUNT(*) FROM clients WHERE excluded=0 AND cold_since IS NOT NULL"),
         }

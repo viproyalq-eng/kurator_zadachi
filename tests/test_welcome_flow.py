@@ -245,3 +245,18 @@ async def test_no_group_notifier_is_fine(tmp_path):
     await e.client_says("бонус", at(6, 12))
     await e.client_says("привіт", at(6, 12, 5))
     assert e.client.welcome_replied_at is not None
+
+
+
+async def test_cold_client_gets_no_messages_and_writing_notifies_group(tmp_path):
+    e = Env(tmp_path)
+    await e.client_says("бонус", at(6, 12))
+    e.service.set_cold(CLIENT, True, at(6, 12, 30))
+    await e.tick(at(6, 14))
+    assert len(e.sent) == 1                       # нагадування холодному не надсилається
+    await e.client_says("Добрый день, я вернулся", at(9, 10))
+    assert any("Холодний клієнт" in g and "/warm" in g for g in e.group)
+    count = len(e.group)
+    await e.client_says("ещё вопрос", at(9, 10, 5))
+    assert len(e.group) == count                 # лише на перше повідомлення
+    assert e.service.create_daily_tasks("2026-11-20", at(20, 7)) == []

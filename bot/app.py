@@ -17,7 +17,7 @@ from .config import Config
 from .db import STATUS_INVESTOR, STATUS_PARTNER, Client, Connection, Database
 from .logic import client_display_name, message_text
 from .notify import Notifier
-from .service import BotService, IncomingMessage
+from .service import BotService, IncomingMessage, cold_row
 from .sheets import SheetWriter, explain_error
 from .importer import ImportError_, load_bytes, parse_export
 from .stats import BOT_STARTED_KEY, build_report, report_grid, summary_text
@@ -39,16 +39,26 @@ COMMANDS = [
     BotCommand("tasks", "Задачі на сьогодні"),
     BotCommand("partner", "Перевести клієнта в партнери"),
     BotCommand("investor", "Повернути клієнта в інвестори"),
+    BotCommand("cold", "Перенести в холодні (без задач і повідомлень)"),
+    BotCommand("warm", "Повернути з холодних"),
     BotCommand("stats", "Статистика роботи куратора"),
     BotCommand("import", "Завантажити старі чати (файл експорту Telegram)"),
     BotCommand("chatid", "ID цього чату"),
     BotCommand("id", "Ваш Telegram ID"),
 ]
 
-STATUS_ACTIONS = {
-    "partner": (STATUS_PARTNER, "🤝", "переведено в партнери"),
-    "investor": (STATUS_INVESTOR, "↩️", "повернуто в інвестори"),
+CLIENT_ACTIONS = {
+    "partner": {"ask": "Кого перевести в партнери?", "icon": "🤝", "verb": "переведено в партнери",
+                "already": "вже партнер"},
+    "investor": {"ask": "Кого повернути в інвестори?", "icon": "↩️", "verb": "повернуто в інвестори",
+                 "already": "вже інвестор"},
+    "cold": {"ask": "Кого перенести в холодні (більше не давати в задачі й не писати)?", "icon": "❄️",
+             "verb": "перенесено в холодні", "already": "вже в холодних"},
+    "warm": {"ask": "Кого повернути з холодних?", "icon": "🔥", "verb": "повернуто з холодних",
+             "already": "і так не в холодних"},
 }
+WHO_HINT = ("Напишіть @username, ім'я (як підписаний), посилання на чат або номер зі сьогоднішнього "
+            "списку задач. Можна кількох одразу: 3 7 @ivan")
 
 
 def client_button_label(c: Client) -> str:
@@ -57,9 +67,13 @@ def client_button_label(c: Client) -> str:
         label += f" @{c.username}"
     if c.last_message_at:
         label += " · " + datetime.fromisoformat(c.last_message_at).strftime("%d.%m.%y")
+    if not c.username:
+        label += f" · id…{str(c.chat_id)[-4:]}"  # щоб розрізнити однаково підписаних
     if c.status == STATUS_PARTNER:
         label = "🤝 " + label
-    return label[:60]
+    if c.cold_since:
+        label = "❄️ " + label
+    return label[:64]
 
 PRIVATE_ONLY = filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE
 
@@ -259,12 +273,14 @@ class BotApp:
         app.add_handler(CommandHandler("tasks", self.cmd_tasks, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("partner", self.cmd_partner, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("investor", self.cmd_investor, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(CommandHandler("cold", self.cmd_cold, filters=filters.UpdateType.MESSAGE))
+        app.add_handler(CommandHandler("warm", self.cmd_warm, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("stats", self.cmd_stats, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("import", self.cmd_import, filters=PRIVATE_ONLY))
         app.add_handler(MessageHandler(PRIVATE_ONLY & filters.Document.ALL, self.on_document))
         app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND,
                                        self.on_name_reply))
-        app.add_handler(CallbackQueryHandler(self.on_status_button, pattern=r"^(partner|investor):-?\d+$"))
+        app.add_handler(CallbackQueryHandler(self.on_status_button, pattern=r"^(partner|investor|cold|warm):-?\d+$"))
         app.add_handler(ChatMemberHandler(self.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, self.on_migrate))
         app.add_error_handler(self.on_error)
@@ -328,30 +344,36 @@ class BotApp:
 
     # --- партнери ---
     async def cmd_partner(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._status_command(update, context, "partner")
+        await self._client_action_command(update, context, "partner")
 
     async def cmd_investor(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._status_command(update, context, "investor")
+        await self._client_action_command(update, context, "investor")
 
-    async def _status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
+    async def cmd_cold(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._client_action_command(update, context, "cold")
+
+    async def cmd_warm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._client_action_command(update, context, "warm")
+
+    async def _client_action_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                     action: str) -> None:
         if not self._allowed(update):
             await update.message.reply_text("Ця команда працює в групі задач або для адмінів.")
             return
         query = " ".join(getattr(context, "args", None) or [])
         if not query:
-            # Команду натиснули з меню без імені — питаємо ім'я і чекаємо відповідь.
+            # Команду натиснули з меню без імені — питаємо, кого саме, і чекаємо відповідь.
             key = (update.effective_chat.id, update.effective_user.id)
             self._awaiting_name[key] = (action, asyncio.get_running_loop().time())
-            who = "перевести в партнери" if action == "partner" else "повернути в інвестори"
             await update.message.reply_text(
-                f"Кого {who}? Напишіть ім'я або @username клієнта (як він підписаний у Telegram).",
-                reply_markup=ForceReply(selective=True, input_field_placeholder="Ім'я або @username"),
+                f"{CLIENT_ACTIONS[action]['ask']}\n{WHO_HINT}",
+                reply_markup=ForceReply(selective=True, input_field_placeholder="@username, ім'я, посилання або №"),
                 do_quote=True)
             return
-        await self._offer_clients(update, action, query)
+        await self._handle_client_action(update, action, query)
 
     async def on_name_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Відповідь з ім'ям клієнта після /partner або /investor без імені."""
+        """Відповідь після /partner, /investor, /cold чи /warm без імені."""
         if not update.effective_chat or not update.effective_user or not update.message:
             return
         key = (update.effective_chat.id, update.effective_user.id)
@@ -370,23 +392,58 @@ class BotApp:
         if not self._allowed(update):
             self._awaiting_name.pop(key, None)
             return
-        if await self._offer_clients(update, action, text):
+        if await self._handle_client_action(update, action, text):
             self._awaiting_name.pop(key, None)
 
-    async def _offer_clients(self, update: Update, action: str, query: str) -> bool:
-        """Шукає клієнтів і показує кнопки. Повертає False, якщо нікого не знайдено."""
-        found = self.service.find_clients(query)
-        if not found:
+    def _apply_client_action(self, action: str, chat_id: int) -> tuple[Client | None, bool]:
+        now = datetime.now(timezone.utc)
+        if action in ("partner", "investor"):
+            status = STATUS_PARTNER if action == "partner" else STATUS_INVESTOR
+            return self.service.set_status(chat_id, status, now)
+        return self.service.set_cold(chat_id, action == "cold", now)
+
+    @staticmethod
+    def _who(client: Client) -> str:
+        who = client.name or "Без імені"
+        return who + (f" (@{client.username})" if client.username else "")
+
+    async def _handle_client_action(self, update: Update, action: str, text: str) -> bool:
+        """Точні вказівки (№, @username, посилання, ID) виконує одразу, ім'я — пропонує кнопками.
+        Повертає False, якщо нікого не знайшли (бот і далі чекає відповідь)."""
+        info = CLIENT_ACTIONS[action]
+        today_tasks = self.db.tasks_for(self._today_local().isoformat())
+        found, missing, words = self.service.resolve_tokens(text, today_tasks)
+        done, already = [], []
+        for c in found:
+            client, changed = self._apply_client_action(action, c.chat_id)
+            if client is not None:
+                (done if changed else already).append(self._who(client))
+        matches = self.service.find_clients(words) if words else []
+        if words and not matches:
+            missing.append(f"«{words}»")
+
+        if done:
+            self._stats_dirty = True
+        lines = []
+        if done:
+            lines.append(f"{info['icon']} {info['verb'].capitalize()}: " + ", ".join(done))
+        if already:
+            lines.append(f"ℹ️ {info['already'].capitalize()}: " + ", ".join(already))
+        if missing:
+            lines.append("❓ Не знайшов: " + ", ".join(missing))
+        if not done and not already and not matches:
             await update.message.reply_text(
-                f"Не знайшов клієнта «{query}». Напишіть іншу частину імені або @username "
-                f"(або «скасувати»).",
-                reply_markup=ForceReply(selective=True, input_field_placeholder="Ім'я або @username"),
+                "\n".join(lines) + f"\n\n{WHO_HINT}\nАбо напишіть «скасувати».",
+                reply_markup=ForceReply(selective=True, input_field_placeholder="@username, ім'я, посилання або №"),
                 do_quote=True)
             return False
-        _, _, verb = STATUS_ACTIONS[action]
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(client_button_label(c), callback_data=f"{action}:{c.chat_id}")] for c in found])
-        await update.message.reply_text(f"Кого {verb.split()[0]}? Натисніть на клієнта:", reply_markup=keyboard)
+        if lines:
+            await update.message.reply_text("\n".join(lines))
+        if matches:
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(client_button_label(c), callback_data=f"{action}:{c.chat_id}")]
+                 for c in matches])
+            await update.message.reply_text(f"«{words}» — кого саме? Натисніть на клієнта:", reply_markup=keyboard)
         return True
 
     async def on_status_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -395,25 +452,21 @@ class BotApp:
             await query.answer("Це можуть робити лише в групі задач або адміни.", show_alert=True)
             return
         action, chat_id = query.data.split(":")
-        status, icon, verb = STATUS_ACTIONS[action]
-        client, changed = self.service.set_status(int(chat_id), status, datetime.now(timezone.utc))
+        info = CLIENT_ACTIONS[action]
+        client, changed = self._apply_client_action(action, int(chat_id))
         if client is None:
             await query.answer("Клієнта не знайдено.", show_alert=True)
             return
-        who = client.name or "Без імені"
-        if client.username:
-            who += f" (@{client.username})"
+        who = self._who(client)
         if not changed:
-            already = ("вже партнер" + (f" з {fmt_date(datetime.fromisoformat(client.partner_since).astimezone(self.cfg.timezone).date())}"
-                                         if client.partner_since else "")) if status == STATUS_PARTNER else "вже інвестор"
-            await query.answer(already)
-            await query.edit_message_text(f"ℹ️ {who} — {already}.")
+            await query.answer(info["already"])
+            await query.edit_message_text(f"ℹ️ {who} — {info['already']}.")
             return
         self._stats_dirty = True
         await query.answer("Готово")
         by = query.from_user.full_name if query.from_user else ""
         today = fmt_date(datetime.now(self.cfg.timezone).date())
-        await query.edit_message_text(f"{icon} {who} — {verb} {today}" + (f" ({by})" if by else "") + ".")
+        await query.edit_message_text(f"{info['icon']} {who} — {info['verb']} {today}" + (f" ({by})" if by else "") + ".")
 
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update):
@@ -434,8 +487,10 @@ class BotApp:
         if not self.sheets:
             return
         grid = report_grid(self._build_report(), self.cfg.timezone)
+        cold_rows = [cold_row(c, self.cfg.timezone) for c in self.db.cold_clients() if not c.excluded]
         try:
             await asyncio.to_thread(self.sheets.write_stats, grid)
+            await asyncio.to_thread(self.sheets.write_cold_list, cold_rows)
         except Exception as e:  # noqa: BLE001
             log.exception("Не вдалося оновити вкладку «Статистика»")
             await self.notifier.notify(f"⚠️ Не вдалося оновити вкладку «Статистика».\n{self._explain_sheets(e)}",
@@ -521,6 +576,8 @@ class BotApp:
             "/tasks — задачі на сьогодні\n"
             "/partner Ім'я — перевести клієнта в партнери\n"
             "/investor Ім'я — повернути в інвестори\n"
+            "/cold — перенести в холодні (номери зі списку, @username, ім'я або посилання)\n"
+            "/warm — повернути з холодних\n"
             "/stats — статистика роботи куратора\n"
             "/import — завантажити старі чати (файл експорту)\n"
             "/status — стан бота (лише для адміна)")
@@ -555,7 +612,7 @@ class BotApp:
         await update.message.reply_text(
             "📊 Стан бота\n"
             f"Клієнтів: {s['clients']} (нових {s['new_clients']}, старих {s['old_clients']}, "
-            f"не клієнтів {s['excluded']}, партнерів {s['partners']})\n"
+            f"не клієнтів {s['excluded']}, партнерів {s['partners']}, холодних {s['cold']})\n"
             f"Повідомлень у базі: {s['messages']}\n"
             f"Надіслано привітань: {s['welcomes']}\n"
             f"Привітальний текст: {welcome_line}\n"

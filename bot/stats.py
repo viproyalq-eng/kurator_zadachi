@@ -21,6 +21,7 @@ METRICS = [
     ("curator_messages", "Повідомлень куратора"),
     ("new_clients", "Нових клієнтів (бонус)"),
     ("new_partners", "Переведено в партнери"),
+    ("new_cold", "Перенесено в холодні"),
 ]
 
 
@@ -30,6 +31,7 @@ class Composition:
     old_investors: int = 0
     partners: int = 0
     excluded: int = 0
+    cold: int = 0   # з них холодних (входять у кількості вище)
 
     @property
     def total(self) -> int:
@@ -63,7 +65,10 @@ def composition(clients: list[Client]) -> Composition:
     for cl in clients:
         if cl.excluded:
             c.excluded += 1
-        elif cl.status == STATUS_PARTNER:
+            continue
+        if cl.cold_since:
+            c.cold += 1
+        if cl.status == STATUS_PARTNER:
             c.partners += 1
         elif cl.client_type == CLIENT_NEW:
             c.new_investors += 1
@@ -100,7 +105,11 @@ def build_report(clients: list[Client], tasks: list[Task], curator_msgs: list[tu
 
     new_clients_by_day: dict[date, int] = {}
     partners_by_day: dict[date, int] = {}
+    cold_by_day: dict[date, int] = {}
     for c in active:
+        d = _local_date(c.cold_since, tz)
+        if d:
+            cold_by_day[d] = cold_by_day.get(d, 0) + 1
         d = _local_date(c.welcome_sent_at, tz)
         if d:
             new_clients_by_day[d] = new_clients_by_day.get(d, 0) + 1
@@ -129,6 +138,7 @@ def build_report(clients: list[Client], tasks: list[Task], curator_msgs: list[tu
             "curator_messages": total(msgs_by_day, start, end),
             "new_clients": total(new_clients_by_day, start, end),
             "new_partners": total(partners_by_day, start, end),
+            "new_cold": total(cold_by_day, start, end),
         }
 
     daily = []
@@ -152,6 +162,7 @@ def build_report(clients: list[Client], tasks: list[Task], curator_msgs: list[tu
 STATS_TAB = "Статистика"
 COMPOSITION_FIRST_ROW = 3        # 0-based: рядок «Нові інвестори» (A4)
 COMPOSITION_ROWS = 3             # нові, старі, партнери — для кругової діаграми
+WORK_HEADER_ROW = 10             # 0-based: «Робота куратора»
 DAILY_HEADER_ROW = 20            # 0-based: заголовок таблиці по днях (A21)
 DAILY_HEADER = ["Дата", "Задач видано", "Виконано", "Клієнт відповів", "Чатів куратора",
                 "Нових клієнтів", "Нових партнерів", "Партнерів всього"]
@@ -170,6 +181,7 @@ def report_grid(report: Report, tz: ZoneInfo) -> list[list]:
         ["Партнери", comp.partners],
         ["Всього клієнтів", comp.total],
         ["Не клієнти (виключені)", comp.excluded],
+        ["З них холодні", comp.cold],
         [],
         ["Робота куратора", *PERIODS],
     ]
@@ -193,7 +205,7 @@ def summary_text(report: Report) -> str:
     lines = [
         "📊 <b>Статистика</b>",
         f"Клієнтів: {comp.total} — нових інвесторів {comp.new_investors}, старих {comp.old_investors}, "
-        f"партнерів {comp.partners}",
+        f"партнерів {comp.partners}; холодних {comp.cold}",
         "",
         "<b>Робота куратора</b>",
     ]
@@ -270,7 +282,7 @@ def format_requests(sheet_id: int) -> list[dict]:
     return [
         bold(0, 1, 1, 14),
         bold(2, 3, 2),
-        bold(9, 10, 1 + len(PERIODS)),
+        bold(WORK_HEADER_ROW, WORK_HEADER_ROW + 1, 1 + len(PERIODS)),
         bold(DAILY_HEADER_ROW, DAILY_HEADER_ROW + 1, GRID_WIDTH),
         {"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},

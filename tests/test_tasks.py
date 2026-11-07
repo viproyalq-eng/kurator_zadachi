@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -248,3 +249,20 @@ def test_previous_version_database_is_migrated(tmp_path):
     db = Database(path)
     assert db.get_client(1).status == "інвестор"
     assert db.tasks_for("2026-11-06")[0].done_text is None
+
+
+@pytest.mark.parametrize("token,chat_id,username", [
+    ("https://web.telegram.org/a/#123456789", 123456789, None),
+    ("web.telegram.org/k/#123456789", 123456789, None),
+    ("tg://user?id=55555", 55555, None),
+    ("@Andriy_B", None, "Andriy_B"),
+    ("https://t.me/andriy_b", None, "andriy_b"),
+    ("t.me/andriy_b/", None, "andriy_b"),
+    ("Olya", None, None),
+    ("https://t.me/+AbCdEf", None, None),   # запрошення в групу — не клієнт
+])
+def test_link_parsing(token, chat_id, username):
+    from bot.service import _chat_id_from_link, _username_from_link
+    assert _chat_id_from_link(token) == chat_id
+    if chat_id is None:
+        assert _username_from_link(token) == username

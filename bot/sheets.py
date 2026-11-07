@@ -28,11 +28,15 @@ TASKS_TAB = "Задачі"
 MESSAGES_HEADER = ["Дата", "Клієнт", "Username", "ID чату", "Хто написав", "Текст"]
 CLIENTS_HEADER = ["ID чату", "Клієнт", "Username", "Тип", "Перший контакт",
                   "Останнє повідомлення", "Хто писав останнім", "Привітання надіслано", "Етап",
-                  "Не клієнт", "Статус", "Партнер з", "Посилання на чат"]
+                  "Не клієнт", "Статус", "Партнер з", "Посилання на чат", "Холодний з"]
 NOT_CLIENT_COLUMN = "Не клієнт"
 NOT_CLIENT_INDEX = CLIENTS_HEADER.index(NOT_CLIENT_COLUMN)  # J — заповнює людина, бот не перезаписує
 TASKS_HEADER = ["Дата задачі", "Клієнт", "Username", "ID чату", "Останній контакт",
                 "Днів без контакту", "Виконано", "Текст дотику", "Клієнт відповів", "Тип задачі", "Посилання на чат"]
+
+COLD_TAB = "Холодні"
+COLD_HEADER = ["Клієнт", "Username", "ID чату", "Холодний з", "Останній контакт", "Хто писав останнім",
+               "Статус", "Посилання на чат"]
 
 TRUTHY = {"так", "да", "yes", "y", "1", "x", "х", "+", "true", "✓", "✔", "✅", "v", "не клієнт"}
 
@@ -178,6 +182,21 @@ class SheetWriter:
         self._worksheet(CLIENTS_TAB, CLIENTS_HEADER)
         self._worksheet(TASKS_TAB, TASKS_HEADER)
         return self._open().title
+
+    # --- вкладка «Холодні» (переписується цілком) ---
+    def write_cold_list(self, rows: list[list]) -> None:
+        try:
+            ss = self._open()
+            titles = [ws.title for ws in ss.worksheets()]
+            if COLD_TAB in titles:
+                ws = ss.worksheet(COLD_TAB)
+                ws.clear()
+            else:
+                ws = ss.add_worksheet(title=COLD_TAB, rows=max(100, len(rows) + 10), cols=len(COLD_HEADER))
+            ws.update(range_name="A1", values=[COLD_HEADER] + rows, value_input_option="RAW")
+        except Exception:
+            self._reset()
+            raise
 
     # --- вкладка «Статистика» ---
     def write_stats(self, grid: list[list]) -> None:

@@ -115,7 +115,7 @@ async def test_commands(app):
 
 
 async def test_handlers_registered(app):
-    assert len(app.application.handlers[0]) == 16
+    assert len(app.application.handlers[0]) == 18
 
 
 async def test_sheet_failure_notifies_once_then_recovers(app):
@@ -307,10 +307,12 @@ async def test_partner_flow_in_tasks_group(app):
     await app.on_status_button(button_update(rec, "partner:100", -1001, 555), SimpleNamespace())
     assert "вже партнер" in rec.edits[-1]
 
+    # за @username — одразу, без кнопок
     await app.cmd_investor(command_update(rec, -1001, 555), SimpleNamespace(args=["@ivan"]))
-    await app.on_status_button(button_update(rec, "investor:100", -1001, 555), SimpleNamespace())
-    assert "повернуто в інвестори" in rec.edits[-1]
+    assert "Повернуто в інвестори: Іван Петренко (@ivan)" in rec.replies[-1]
     assert app.db.get_client(100).status == "інвестор"
+    await app.on_status_button(button_update(rec, "investor:100", -1001, 555), SimpleNamespace())
+    assert "вже інвестор" in rec.edits[-1]
 
 
 async def test_partner_command_hints_and_permissions(app):
@@ -351,7 +353,7 @@ async def test_partner_asks_for_name_then_shows_buttons(app):
     rec = Recorder()
     # натиснули /partner у меню — команда пішла без імені
     await app.cmd_partner(command_update(rec, -1001, 555), SimpleNamespace(args=[]))
-    assert "Кого перевести в партнери" in rec.replies[-1]
+    assert "Кого перевести в партнери" in rec.replies[-1] and "посилання на чат" in rec.replies[-1]
     assert isinstance(rec.markups[-1], ForceReply)
 
     # інший учасник групи пише щось своє — бот не реагує
@@ -362,8 +364,8 @@ async def test_partner_asks_for_name_then_shows_buttons(app):
     await app.on_name_reply(command_update(rec, -1001, 555, "Мирослав"), SimpleNamespace())
     assert "Не знайшов" in rec.replies[-1]
 
-    # правильне ім'я — кнопки
-    await app.on_name_reply(command_update(rec, -1001, 555, "@ivan"), SimpleNamespace())
+    # ім'я, як підписаний — кнопки
+    await app.on_name_reply(command_update(rec, -1001, 555, "Іван"), SimpleNamespace())
     assert rec.markups[-1].inline_keyboard[0][0].callback_data == "partner:100"
 
     # після цього звичайні повідомлення вже не перехоплюються
@@ -380,3 +382,67 @@ async def test_partner_question_can_be_cancelled(app):
     await app.on_name_reply(command_update(rec, -1001, 555, "Скасувати"), SimpleNamespace())
     assert rec.replies[-1] == "Скасовано."
     assert not app._awaiting_name
+
+
+
+async def test_cold_by_numbers_links_and_names(app):
+    from datetime import datetime, timedelta, timezone
+    from bot.db import CLIENT_OLD, Client
+    app.cfg.tasks_chat_id = -1001
+    old = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+    for cid, name, user in [(201, "Olya", None), (202, "Olya", None), (203, "Andriy B.", "andriy_b"),
+                            (204, "Nik", None)]:
+        app.db.upsert_client(Client(cid, None, name, user, CLIENT_OLD, old, old, "клієнт", None, None))
+    tasks = app.service.create_daily_tasks(app._today_local().isoformat(), datetime.now(timezone.utc))
+    assert len(tasks) == 4
+    rec = Recorder()
+
+    # номер зі списку + @username + посилання «відкрити чат» — одним повідомленням
+    await app.cmd_cold(command_update(rec, -1001, 555),
+                       SimpleNamespace(args=["1", "@andriy_b", "https://web.telegram.org/a/#204", "99"]))
+    reply = rec.replies[-1]
+    assert "Перенесено в холодні" in reply and "Andriy B. (@andriy_b)" in reply and "Nik" in reply
+    assert "Не знайшов: №99" in reply
+    first = tasks[0].chat_id
+    assert app.db.get_client(first).cold_since and app.db.get_client(203).cold_since
+    assert app.db.get_client(204).cold_since
+
+    # однаково підписані — кнопки з різними id
+    await app.cmd_cold(command_update(rec, -1001, 555), SimpleNamespace(args=["Olya"]))
+    labels = [row[0].text for row in rec.markups[-1].inline_keyboard]
+    assert len(labels) == 2 and labels[0] != labels[1] and all("id…" in label for label in labels)
+
+    # холодні не потрапляють у задачі наступного дня
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1))
+    next_day = app.service.create_daily_tasks((app._today_local() + timedelta(days=1)).isoformat(), tomorrow)
+    assert {t.chat_id for t in next_day}.isdisjoint({first, 203, 204})
+
+    # повернути з холодних
+    await app.cmd_warm(command_update(rec, -1001, 555), SimpleNamespace(args=["@andriy_b"]))
+    assert "Повернуто з холодних" in rec.replies[-1] and app.db.get_client(203).cold_since is None
+    await app.cmd_warm(command_update(rec, -1001, 555), SimpleNamespace(args=["@andriy_b"]))
+    assert "і так не в холодних" in rec.replies[-1].lower()
+
+
+async def test_cold_list_written_to_sheet(app):
+    from datetime import datetime, timezone
+    from bot.db import CLIENT_OLD, Client
+    app.db.upsert_client(Client(301, None, "Olya", None, CLIENT_OLD, "2025-01-18T10:00:00+00:00",
+                                "2025-01-18T10:00:00+00:00", "клієнт", None, None))
+    app.service.set_cold(301, True, datetime.now(timezone.utc))
+    written = {}
+
+    class Sheets:
+        def write_stats(self, grid):
+            written["stats"] = grid
+
+        def write_cold_list(self, rows):
+            written["cold"] = rows
+
+        def queue_client(self, *a, **k):
+            pass
+
+    app.sheets = Sheets()
+    await app.refresh_stats()
+    row = written["cold"][0]
+    assert row[0] == "Olya" and row[2] == "301" and row[7] == "https://web.telegram.org/a/#301"

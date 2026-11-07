@@ -48,7 +48,8 @@ def test_composition():
 def test_periods():
     p = make_report().periods
     assert p["Сьогодні"] == {"issued": 3, "done": 2, "done_pct": 67, "replied": 1, "curator_chats": 2,
-                             "curator_messages": 3, "new_clients": 1, "new_partners": 1}
+                             "curator_messages": 3, "new_clients": 1, "new_partners": 1,
+                             "new_cold": 0}
     assert p["Вчора"]["issued"] == 2 and p["Вчора"]["done"] == 1 and p["Вчора"]["curator_chats"] == 1
     assert p["7 днів"]["issued"] == 5 and p["7 днів"]["new_clients"] == 2
     assert p["30 днів"]["issued"] == 6 and p["30 днів"]["curator_messages"] == 5
@@ -76,7 +77,7 @@ def test_grid_layout_matches_charts():
     assert grid[COMPOSITION_FIRST_ROW + 2][0] == "Партнери"
     assert grid[DAILY_HEADER_ROW] == DAILY_HEADER
     assert len(grid) == DAILY_HEADER_ROW + 1 + 30
-    assert grid[12][0] == "% виконання" and grid[12][1] == "67%"
+    assert grid[13][0] == "% виконання" and grid[13][1] == "67%"
     reqs = chart_requests(42)
     assert len(reqs) == 3
     pie = reqs[0]["addChart"]["chart"]["spec"]["pieChart"]["domain"]["sourceRange"]["sources"][0]

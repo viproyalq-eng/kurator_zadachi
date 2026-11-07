@@ -31,6 +31,9 @@ class FakeWS:
     def add_rows(self, n):
         self._row_count += n
 
+    def clear(self):
+        self.rows = []
+
     def row_values(self, n):
         return self.rows[n - 1] if len(self.rows) >= n else []
 
@@ -343,3 +346,28 @@ def test_write_dashboard(writer):
     colored = [r for r in reqs if "backgroundColor" in r.get("repeatCell", {}).get("cell", {})
                .get("userEnteredFormat", {})]
     assert [r["repeatCell"]["range"]["startRowIndex"] for r in colored] == [0, 2]
+
+
+def test_write_stages_adds_color_rules_once(writer):
+    w, ss = writer
+    batches, rules = [], {}
+
+    def fetch_sheet_metadata(params=None):
+        return {"sheets": [{"properties": {"sheetId": ws.id}, "conditionalFormats": rules.get(ws.id, [])}
+                           for ws in ss.tabs.values()]}
+
+    def batch_update(body):
+        batches.append(body)
+        for r in body["requests"]:
+            if "addConditionalFormatRule" in r:
+                sid = r["addConditionalFormatRule"]["rule"]["ranges"][0]["sheetId"]
+                rules.setdefault(sid, []).append(r)
+
+    ss.fetch_sheet_metadata = fetch_sheet_metadata
+    ss.batch_update = batch_update
+    header = ["Клієнт", "Тема 1", "Тема 2"]
+    w.write_stages(header, [["Іван", "✅ 03.11.26", "❌"]])
+    w.write_stages(header, [["Іван", "✅ 03.11.26", "✅ 05.11.26"]])
+    tab = ss.tabs["Етапи клієнтів"]
+    assert tab.rows[1] == ["Іван", "✅ 03.11.26", "✅ 05.11.26"]
+    assert len(batches) == 1 and len(rules[tab.id]) == 4      # ✅ ❌ ➖ ⚠️ — лише один раз

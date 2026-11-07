@@ -23,6 +23,7 @@ from .service import BotService, IncomingMessage, cold_row, partner_row
 from .sheets import SheetWriter, explain_error
 from .backup import (LAST_BACKUP_KEY, TELEGRAM_SEND_LIMIT, BackupError, extract_backup, is_backup_name,
                      make_backup, replace_database, rotate)
+from .course import COURSE_TAB, course_chart_specs
 from .efficiency import EFFICIENCY_TAB
 from .importer import ImportError_, load_bytes, parse_export
 from .stats import BOT_STARTED_KEY, build_report, report_grid, summary_text
@@ -350,10 +351,11 @@ class BotApp:
                     self.db.set_setting(LAST_RUN_KEY, now_local.date().isoformat())
                     await self.send_daily_tasks()
                     self._stats_dirty = True
-                elif self.sheets and loop.time() - last_flags_sync > FLAGS_SYNC_SECONDS:
+                elif loop.time() - last_flags_sync > FLAGS_SYNC_SECONDS:
                     last_flags_sync = loop.time()
                     await self._sync_not_client_flags()
-                if self.sheets and (self._stats_dirty or self.service.tasks_dirty
+                    await self.service.check_lost()
+                if self.sheets and (self._stats_dirty or self.service.tasks_dirty or self.service.stages_dirty
                                     or loop.time() - last_stats > STATS_SECONDS):
                     last_stats = loop.time()
                     # спершу дописуємо чергу, щоб статистика й інші вкладки збігалися
@@ -617,9 +619,13 @@ class BotApp:
         open_rows, done_rows = self.service.task_lists()
         self.service.tasks_dirty = False
         eff = self.service.efficiency(datetime.now(timezone.utc))
+        (stages_hdr, stages_data), course = self.service.course_tabs(datetime.now(timezone.utc))
         try:
             await asyncio.to_thread(self.sheets.write_task_lists, open_rows, done_rows)
             await asyncio.to_thread(self.sheets.write_dashboard, EFFICIENCY_TAB, eff.rows, eff.styles)
+            await asyncio.to_thread(self.sheets.write_stages, stages_hdr, stages_data)
+            await asyncio.to_thread(self.sheets.write_dashboard, COURSE_TAB, course.rows, course.styles,
+                                    course_chart_specs)
             await asyncio.to_thread(self.sheets.write_stats, grid)
             await asyncio.to_thread(self.sheets.write_partner_list, partner_rows)
             await asyncio.to_thread(self.sheets.write_cold_list, cold_rows)
@@ -685,6 +691,7 @@ class BotApp:
         started = self.db.get_setting(BOT_STARTED_KEY)
         before = datetime.fromisoformat(started) if started else None
         report = self.service.import_export(export, before, datetime.now(timezone.utc))
+        course_updated = self.service.rescan_course_history()
         self._stats_dirty = True
         oldest = (fmt_date(datetime.fromisoformat(report.oldest_contact).astimezone(self.cfg.timezone).date())
                   if report.oldest_contact else "—")
@@ -697,7 +704,8 @@ class BotApp:
             f"інших {report.skipped_other} (збережене, видалені акаунти, службові, порожні)\n"
             f"Найдавніший контакт: {oldest}\n"
             f"Готові до задач ({self.cfg.tasks_min_days}+ днів без контакту): {report.ready_for_tasks} — "
-            f"щоранку по {self.cfg.tasks_per_day}.\n\n"
+            f"щоранку по {self.cfg.tasks_per_day}.\n"
+            f"Етапи курсу знайдено в переписках: {course_updated} клієнтів (вкладка «Етапи клієнтів»).\n\n"
             "Далі: відкрийте в таблиці вкладку «Клієнти» і поставте «так» у стовпці «Не клієнт» "
             "друзям, рідним і колегам — у задачі вони не потраплятимуть.")
         if export.owner_id is None and owner is None:
@@ -808,6 +816,12 @@ class BotApp:
     async def _post_init(self, application: Application) -> None:
         if not self.db.get_setting(BOT_STARTED_KEY):
             self.db.set_setting(BOT_STARTED_KEY, datetime.now(timezone.utc).isoformat())
+        try:
+            updated = self.service.rescan_course_history()  # етапи курсу зі збереженої історії
+            if updated:
+                log.info("Етапи курсу з історії: оновлено %s клієнтів", updated)
+        except Exception:  # noqa: BLE001
+            log.exception("Не вдалося переглянути історію на теми курсу")
         me = await application.bot.get_me()
         try:
             await application.bot.set_my_commands(COMMANDS)

@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS clients (
     partner_since TEXT,
     welcome_replied_at TEXT,
     reminder_sent_at TEXT,
-    cold_since TEXT
+    cold_since TEXT,
+    stage_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -82,6 +83,13 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
 
 CREATE INDEX IF NOT EXISTS idx_sched_status ON scheduled_messages(status, due_at);
 
+CREATE TABLE IF NOT EXISTS client_stages (
+    chat_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,        -- bonus | t1 … t11 | lost:t3 | lost_task:t3
+    at TEXT NOT NULL,           -- коли вперше (UTC)
+    PRIMARY KEY (chat_id, stage)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -107,6 +115,7 @@ class Client:
     welcome_replied_at: str | None = None   # клієнт відповів після привітання
     reminder_sent_at: str | None = None     # бот надіслав нагадування
     cold_since: str | None = None           # «холодний»: без задач і без повідомлень бота
+    stage_at: str | None = None             # коли клієнт перейшов на поточний етап
 
 
 @dataclass
@@ -168,7 +177,7 @@ class Database:
             self.conn.execute("ALTER TABLE clients ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
         if "status" not in cols:
             self.conn.execute(f"ALTER TABLE clients ADD COLUMN status TEXT NOT NULL DEFAULT '{STATUS_INVESTOR}'")
-        for col in ("partner_since", "welcome_replied_at", "reminder_sent_at", "cold_since"):
+        for col in ("partner_since", "welcome_replied_at", "reminder_sent_at", "cold_since", "stage_at"):
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE clients ADD COLUMN {col} TEXT")
         task_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(tasks)")}
@@ -213,17 +222,17 @@ class Database:
         self.conn.execute(
             """INSERT INTO clients (chat_id, business_connection_id, name, username, client_type, first_seen,
                                     last_message_at, last_from, welcome_sent_at, stage, excluded,
-                                    welcome_replied_at, reminder_sent_at)
+                                    welcome_replied_at, reminder_sent_at, stage_at)
                VALUES (:chat_id, :business_connection_id, :name, :username, :client_type, :first_seen,
                        :last_message_at, :last_from, :welcome_sent_at, :stage, :excluded,
-                       :welcome_replied_at, :reminder_sent_at)
+                       :welcome_replied_at, :reminder_sent_at, :stage_at)
                ON CONFLICT(chat_id) DO UPDATE SET business_connection_id=excluded.business_connection_id,
                  name=excluded.name, username=excluded.username, client_type=excluded.client_type,
                  first_seen=MIN(clients.first_seen, excluded.first_seen),
                  last_message_at=excluded.last_message_at, last_from=excluded.last_from,
                  welcome_sent_at=excluded.welcome_sent_at, stage=excluded.stage,
                  excluded=excluded.excluded, welcome_replied_at=excluded.welcome_replied_at,
-                 reminder_sent_at=excluded.reminder_sent_at""",
+                 reminder_sent_at=excluded.reminder_sent_at, stage_at=excluded.stage_at""",
             {k: v for k, v in client.__dict__.items() if k not in ("status", "partner_since", "cold_since")},
         )
         self.conn.commit()
@@ -491,6 +500,36 @@ class Database:
         return self.conn.execute(
             """SELECT COUNT(DISTINCT m.chat_id) FROM messages m JOIN clients c ON c.chat_id = m.chat_id
                WHERE c.excluded=0 AND m.sender=? AND m.date >= ?""", (client_sender, since_iso)).fetchone()[0]
+
+    # --- етапи курсу ---
+    def record_stage(self, chat_id: int, stage: str, at_iso: str) -> bool:
+        """Запам'ятовує етап (найранішу дату). Повертає True, якщо етап новий."""
+        existed = self.conn.execute("SELECT 1 FROM client_stages WHERE chat_id=? AND stage=?",
+                                    (chat_id, stage)).fetchone() is not None
+        self.conn.execute(
+            """INSERT INTO client_stages (chat_id, stage, at) VALUES (?, ?, ?)
+               ON CONFLICT(chat_id, stage) DO UPDATE SET at=MIN(at, excluded.at)""", (chat_id, stage, at_iso))
+        self.conn.commit()
+        return not existed
+
+    def stages_of(self, chat_id: int) -> dict[str, str]:
+        return {r[0]: r[1] for r in self.conn.execute("SELECT stage, at FROM client_stages WHERE chat_id=?", (chat_id,))}
+
+    def all_stages(self) -> dict[int, dict[str, str]]:
+        out: dict[int, dict[str, str]] = {}
+        for chat_id, stage, at in self.conn.execute("SELECT chat_id, stage, at FROM client_stages"):
+            out.setdefault(chat_id, {})[stage] = at
+        return out
+
+    def last_message_at_by(self, chat_id: int, senders: tuple[str, ...]) -> str | None:
+        marks = ",".join("?" for _ in senders)
+        return self.conn.execute(f"SELECT MAX(date) FROM messages WHERE chat_id=? AND sender IN ({marks})",
+                                 (chat_id, *senders)).fetchone()[0]
+
+    def curator_texts(self, curator: str) -> list[tuple[int, str, str]]:
+        """(chat_id, date, text) повідомлень куратора з посиланнями/текстом — для пошуку тем в історії."""
+        return [tuple(r) for r in self.conn.execute(
+            "SELECT chat_id, date, text FROM messages WHERE sender=? AND text IS NOT NULL ORDER BY date", (curator,))]
 
     def owner_ids(self) -> set[int]:
         return {r[0] for r in self.conn.execute("SELECT owner_user_id FROM business_connections")}

@@ -351,7 +351,10 @@ async def test_refresh_stats_writes_grid(app):
         def write_task_lists(self, open_rows, done_rows):
             pass
 
-        def write_dashboard(self, title, rows, styles):
+        def write_dashboard(self, title, rows, styles, charts=None, chart_col=None):
+            pass
+
+        def write_stages(self, header, rows):
             pass
 
     app.sheets = Sheets()
@@ -463,8 +466,11 @@ async def test_cold_list_written_to_sheet(app):
         def write_task_lists(self, open_rows, done_rows):
             written["tasks"] = (open_rows, done_rows)
 
-        def write_dashboard(self, title, rows, styles):
-            written["dashboard"] = (title, rows, styles)
+        def write_dashboard(self, title, rows, styles, charts=None, chart_col=None):
+            written.setdefault("dashboards", {})[title] = (rows, styles, charts)
+
+        def write_stages(self, header, rows):
+            written["stages"] = (header, rows)
 
         def queue_client(self, *a, **k):
             pass
@@ -473,8 +479,11 @@ async def test_cold_list_written_to_sheet(app):
     await app.refresh_stats()
     row = written["cold"][0]
     assert row[0] == "Olya" and row[2] == "301" and row[7] == "https://web.telegram.org/a/#301"
-    title, rows, styles = written["dashboard"]
-    assert title == "Ефективність куратора" and rows[0][0].startswith("📈")
+    rows, styles, _ = written["dashboards"]["Ефективність куратора"]
+    assert rows[0][0].startswith("📈")
+    course_rows, _, course_charts = written["dashboards"]["Ефективність клієнта"]
+    assert course_rows[0][0].startswith("🎓") and course_charts is not None
+    assert written["stages"][0][0] == "Клієнт"
     p = written["partners"]
     assert len(p) == 1 and p[0][0] == "Andriy B." and p[0][1] == "@andriy_b"
     assert p[0][3] == "07.11.2026 11:00" and p[0][4] == "новий" and p[0][9] == "https://t.me/andriy_b"

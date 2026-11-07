@@ -246,9 +246,9 @@ def _range(sheet_id: int, r0: int, r1: int, c0: int, c1: int) -> dict:
                                          "startColumnIndex": c0, "endColumnIndex": c1}]}}
 
 
-def _position(sheet_id: int, row: int) -> dict:
+def _position(sheet_id: int, row: int, col: int = CHART_COLUMN) -> dict:
     return {"overlayPosition": {"anchorCell": {"sheetId": sheet_id, "rowIndex": row,
-                                               "columnIndex": CHART_COLUMN},
+                                               "columnIndex": col},
                                 "widthPixels": 560, "heightPixels": 320}}
 
 
@@ -293,10 +293,16 @@ def chart_specs(sheet_id: int) -> list[tuple[str, dict, int]]:
     ]
 
 
-def chart_requests(sheet_id: int, existing_titles: set[str] | None = None) -> list[dict]:
+def add_chart_requests(sheet_id: int, specs: list[tuple[str, dict, int]], existing_titles: set[str] | None = None,
+                       col: int = CHART_COLUMN) -> list[dict]:
+    """Запити на додавання діаграм, яких ще немає (за назвою)."""
     existing = existing_titles or set()
-    return [{"addChart": {"chart": {"spec": {"title": title, **spec}, "position": _position(sheet_id, row)}}}
-            for title, spec, row in chart_specs(sheet_id) if title not in existing]
+    return [{"addChart": {"chart": {"spec": {"title": title, **spec}, "position": _position(sheet_id, row, col)}}}
+            for title, spec, row in specs if title not in existing]
+
+
+def chart_requests(sheet_id: int, existing_titles: set[str] | None = None) -> list[dict]:
+    return add_chart_requests(sheet_id, chart_specs(sheet_id), existing_titles)
 
 
 def format_requests(sheet_id: int) -> list[dict]:

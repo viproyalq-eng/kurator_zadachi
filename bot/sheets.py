@@ -29,7 +29,7 @@ DONE_TASKS_TAB = "Виконані задачі"
 MESSAGES_HEADER = ["Дата", "Клієнт", "Username", "ID чату", "Хто написав", "Текст"]
 CLIENTS_HEADER = ["ID чату", "Клієнт", "Username", "Тип", "Перший контакт",
                   "Останнє повідомлення", "Хто писав останнім", "Привітання надіслано", "Етап",
-                  "Не клієнт", "Статус", "Партнер з", "Посилання на чат", "Холодний з"]
+                  "Не клієнт", "Статус", "Партнер з", "Посилання на чат", "Холодний з", "Етап з"]
 NOT_CLIENT_COLUMN = "Не клієнт"
 NOT_CLIENT_INDEX = CLIENTS_HEADER.index(NOT_CLIENT_COLUMN)  # J — заповнює людина, бот не перезаписує
 TASKS_HEADER = ["Дата задачі", "Клієнт", "Username", "ID чату", "Останній контакт",
@@ -215,7 +215,9 @@ class SheetWriter:
         self.write_list(DONE_TASKS_TAB, TASKS_HEADER, done_rows)
 
     # --- вкладка «Ефективність куратора» (переписується цілком, з оформленням) ---
-    def write_dashboard(self, title: str, rows: list[list], styles: list[tuple[int, str]]) -> None:
+    def write_dashboard(self, title: str, rows: list[list], styles: list[tuple[int, str]],
+                        charts=None, chart_col: int | None = None) -> None:
+        """charts(sheet_id) -> [(назва, spec, рядок)] — діаграми додаються один раз (за назвою)."""
         try:
             ss = self._open()
             titles = [ws.title for ws in ss.worksheets()]
@@ -229,6 +231,37 @@ class SheetWriter:
                 ws.add_rows(len(rows) + 50 - ws.row_count)
             ws.update(range_name="A1", values=rows, value_input_option="RAW")
             ss.batch_update({"requests": dashboard_format_requests(ws.id, len(rows), width, styles)})
+            if charts:
+                from .stats import add_chart_requests
+                existing = self._chart_titles(ss, ws)
+                missing = add_chart_requests(ws.id, charts(ws.id), existing, chart_col or width + 1)
+                if missing:
+                    ss.batch_update({"requests": missing})
+        except Exception:
+            self._reset()
+            raise
+
+    @staticmethod
+    def _chart_titles(ss, ws) -> set[str]:
+        meta = ss.fetch_sheet_metadata(
+            params={"fields": "sheets(properties(sheetId,title),charts(chartId,spec(title)))"})
+        for sheet in meta.get("sheets", []):
+            if sheet["properties"]["sheetId"] == ws.id:
+                return {c.get("spec", {}).get("title", "") for c in sheet.get("charts", [])}
+        return set()
+
+    # --- вкладка «Етапи клієнтів»: ✅ зелені, ❌ червоні ---
+    def write_stages(self, header: list[str], rows: list[list]) -> None:
+        from .course import STAGES_TAB
+        self.write_list(STAGES_TAB, header, rows)
+        try:
+            ss = self._open()
+            ws = ss.worksheet(STAGES_TAB)
+            meta = ss.fetch_sheet_metadata(params={"fields": "sheets(properties(sheetId),conditionalFormats)"})
+            has_rules = any(sh["properties"]["sheetId"] == ws.id and sh.get("conditionalFormats")
+                            for sh in meta.get("sheets", []))
+            if not has_rules:
+                ss.batch_update({"requests": stages_format_requests(ws.id, len(header))})
         except Exception:
             self._reset()
             raise
@@ -415,3 +448,31 @@ def dashboard_format_requests(sheet_id: int, n_rows: int, width: int, styles: li
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": c0, "endIndex": c1},
             "properties": {"pixelSize": px}, "fields": "pixelSize"}})
     return reqs
+
+
+
+def stages_format_requests(sheet_id: int, width: int) -> list[dict]:
+    """Кольори для ✅ / ❌ / ➖ / ⚠️, закріплений заголовок і перший стовпець (додається один раз)."""
+    area = {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 5000, "startColumnIndex": 0,
+            "endColumnIndex": width}
+
+    def rule(kind: str, value: str, bg: tuple) -> dict:
+        return {"addConditionalFormatRule": {"index": 0, "rule": {
+            "ranges": [area],
+            "booleanRule": {"condition": {"type": kind, "values": [{"userEnteredValue": value}]},
+                            "format": {"backgroundColor": _rgb(bg)}}}}}
+
+    return [
+        rule("TEXT_STARTS_WITH", "✅", (0.80, 0.94, 0.80)),
+        rule("TEXT_EQ", "❌", (0.98, 0.82, 0.82)),
+        rule("TEXT_STARTS_WITH", "➖", (0.92, 0.92, 0.92)),
+        rule("TEXT_STARTS_WITH", "⚠️", (1.0, 0.90, 0.70)),
+        {"updateSheetProperties": {"properties": {"sheetId": sheet_id,
+                                                  "gridProperties": {"frozenRowCount": 1, "frozenColumnCount": 1}},
+                                   "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount"}},
+        {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                                  "startColumnIndex": 0, "endColumnIndex": width},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
+                                                       "backgroundColor": _rgb((0.80, 0.88, 0.98))}},
+                        "fields": "userEnteredFormat(textFormat,backgroundColor)"}},
+    ]

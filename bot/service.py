@@ -12,7 +12,9 @@ from typing import Awaitable, Callable
 from .config import Config
 from .db import CLIENT_NEW, CLIENT_OLD, STATUS_INVESTOR, STATUS_PARTNER, Client, Database, Scheduled, Task
 from .logic import SENDER_BOT, SENDER_CLIENT, fmt_dt, is_bonus
+from .course import STAGE_BONUS, TOPIC_BY_KEY, detect_topics, latest_topic
 from .schedule import in_send_window, next_send_time, reply_deadline
+from .texts import LOST_AFTER_DAYS
 from .tasks import chat_url, cutoff_utc, person_link, task_row
 from .notify import Notifier
 
@@ -32,6 +34,7 @@ ROUND_START_KEY = "round_started_at"
 ROUND_HISTORY_KEY = "rounds_history"
 
 TASK_STALE = "stale"
+TASK_LOST = "lost"
 TASK_MISSED = "missed"
 TASK_NO_REPLY = "no_reply"
 
@@ -96,6 +99,7 @@ class BotService:
                  notify_group: Callable[[str], Awaitable[object]] | None = None):
         self.notify_group = notify_group  # повідомлення в групу «Задачі куратора» (HTML)
         self.tasks_dirty = False          # треба переписати вкладки задач у таблиці
+        self.stages_dirty = False         # треба переписати вкладки етапів курсу
         self.cfg = cfg
         self.db = db
         self.sheets = sheets  # SheetWriter або None, якщо таблиця не налаштована
@@ -159,6 +163,9 @@ class BotService:
             for task in self.db.mark_tasks_done(client.chat_id, msg.date.isoformat(), msg.text):
                 self._queue_task(task)
             self.db.cancel_scheduled(client.chat_id, (KIND_WELCOME, KIND_REMINDER))
+            topics = detect_topics(msg.text)
+            if topics:
+                self._apply_topics(client, topics, msg.date)
             if self.db.get_setting(ROUND_START_KEY):
                 await self.maybe_finish_round(self._now())
         elif sender == SENDER_CLIENT:
@@ -177,13 +184,109 @@ class BotService:
                     f"«{html.escape((msg.text or '')[:400])}»\n\nЯкщо варто знову вести — /warm")
 
         if wants_welcome:
+            self.db.record_stage(client.chat_id, STAGE_BONUS, msg.date.isoformat())
+            self.stages_dirty = True
             await self._start_welcome(client, msg.date)
+
+    # --- курс інвестора: етапи ---
+    def _apply_topics(self, client: Client, keys: list[str], at: datetime) -> None:
+        for key in keys:
+            self.db.record_stage(client.chat_id, key, at.isoformat())
+        self._refresh_client_stage(client)
+        self.stages_dirty = True
+
+    def _refresh_client_stage(self, client: Client) -> bool:
+        """Етап у «Клієнтах» = найдальша отримана тема (якщо вона новіша за поточний етап)."""
+        stored = self.db.stages_of(client.chat_id)
+        key = latest_topic({k: datetime.fromisoformat(v) for k, v in stored.items() if k in TOPIC_BY_KEY})
+        if not key:
+            return False
+        label, at = TOPIC_BY_KEY[key].label, stored[key]
+        if client.stage == label and client.stage_at == at:
+            return False
+        if client.stage_at and client.stage_at > at and client.stage not in TOPIC_LABELS:
+            return False  # пізніший не-курсовий етап (напр. відповів на привітання) — не чіпаємо
+        client.stage, client.stage_at = label, at
+        self.db.upsert_client(client)
+        self._queue_client(client)
+        return True
+
+    def rescan_course_history(self) -> int:
+        """Шукає теми курсу в усій збереженій історії (і імпортованій). Повертає, скільки клієнтів оновлено."""
+        touched: set[int] = set()
+        for chat_id, date, text in self.db.curator_texts(self.cfg.curator_name):
+            low = text.lower()
+            if "youtu" not in low and not any(p for t in TOPIC_BY_KEY.values() for p in t.phrases if p in low):
+                continue
+            for key in detect_topics(text):
+                self.db.record_stage(chat_id, key, date)
+                touched.add(chat_id)
+        updated = 0
+        for chat_id in touched:
+            client = self.db.get_client(chat_id)
+            if client and self._refresh_client_stage(client):
+                updated += 1
+        if touched:
+            self.stages_dirty = True
+        return updated
+
+    def _ball_with_client_since(self, chat_id: int) -> datetime | None:
+        """Якщо останнім писав Віктор (або бот) — коли саме. Інакше None (чекаємо Віктора)."""
+        last_out = self.db.last_message_at_by(chat_id, (self.cfg.curator_name, SENDER_BOT))
+        last_in = self.db.last_message_at_by(chat_id, (SENDER_CLIENT,))
+        if not last_out or (last_in and last_in > last_out):
+            return None
+        return datetime.fromisoformat(last_out)
+
+    async def check_lost(self, now: datetime | None = None) -> int:
+        """«Пропав після теми N»: після теми останнім писав Віктор, а клієнт мовчить LOST_AFTER_DAYS днів."""
+        now = now or self._now()
+        alerted = 0
+        for chat_id, stored in self.db.all_stages().items():
+            client = self.db.get_client(chat_id)
+            if client is None or client.excluded or client.cold_since or client.status == STATUS_PARTNER:
+                continue
+            key = latest_topic({k: datetime.fromisoformat(v) for k, v in stored.items() if k in TOPIC_BY_KEY})
+            if not key or f"lost:{key}" in stored:
+                continue
+            since = self._ball_with_client_since(chat_id)
+            if since is None or since.isoformat() < stored[key] or now - since < timedelta(days=LOST_AFTER_DAYS):
+                continue
+            self.db.record_stage(chat_id, f"lost:{key}", now.isoformat())
+            self.stages_dirty = True
+            alerted += 1
+            if self.notify_group:
+                topic_at = datetime.fromisoformat(stored[key]).astimezone(self.cfg.timezone).strftime("%d.%m")
+                await self.notify_group(
+                    f"⚠️ {person_link(client.chat_id, client.name, client.username)} пропав після "
+                    f"<b>{TOPIC_BY_KEY[key].label}</b> (надіслана {topic_at}) — мовчить "
+                    f"{(now - since).days} дн.\nТреба втрутитися.")
+        return alerted
+
+    def _lost_candidates(self) -> tuple[list[Client], dict[int, str]]:
+        """Хто «пропав» і ще не отримав за це задачу; Віктор після сповіщення не писав, клієнт мовчить."""
+        clients, notes = [], {}
+        for chat_id, stored in self.db.all_stages().items():
+            for stage, at in stored.items():
+                if not stage.startswith("lost:") or f"lost_task:{stage[5:]}" in stored:
+                    continue
+                client = self.db.get_client(chat_id)
+                if client is None or client.excluded or client.cold_since or client.status == STATUS_PARTNER:
+                    continue
+                last_in = self.db.last_message_at_by(chat_id, (SENDER_CLIENT,))
+                if (last_in and last_in > at) or self.db.curator_wrote_after(chat_id, self.cfg.curator_name, at):
+                    continue  # повернувся або Віктор уже втрутився
+                topic = TOPIC_BY_KEY.get(stage[5:])
+                clients.append(client)
+                notes[chat_id] = f"пропав після «{topic.label if topic else stage[5:]}» — втрутитися"
+                self.db.record_stage(chat_id, f"lost_task:{stage[5:]}", at)
+        return clients, notes
 
     # --- привітання, нагадування ---
     async def _on_welcome_reply(self, client: Client, msg: IncomingMessage) -> None:
         after_reminder = bool(client.reminder_sent_at)
         client.welcome_replied_at = msg.date.isoformat()
-        client.stage = STAGE_REPLIED
+        _set_stage(client, STAGE_REPLIED, msg.date)
         self.db.upsert_client(client)
         self._queue_client(client)
         self.db.cancel_scheduled(client.chat_id, (KIND_REMINDER,))
@@ -210,7 +313,7 @@ class BotService:
             sched = self.db.scheduled(client.chat_id, "pending")
             await self._deliver(next(s for s in sched if s.id == sched_id), now)
         else:
-            client.stage = STAGE_WELCOME_WAITING
+            _set_stage(client, STAGE_WELCOME_WAITING, now)
             self.db.upsert_client(client)
             self._queue_client(client)
 
@@ -269,10 +372,10 @@ class BotService:
         client.last_from = SENDER_BOT
         if sched.kind == KIND_WELCOME:
             client.welcome_sent_at = date.isoformat()
-            client.stage = STAGE_WELCOME_SENT
+            _set_stage(client, STAGE_WELCOME_SENT, date)
         else:
             client.reminder_sent_at = date.isoformat()
-            client.stage = STAGE_REMINDER_SENT
+            _set_stage(client, STAGE_REMINDER_SENT, date)
         self.db.upsert_client(client)
         self._queue_rows(client, SENDER_BOT, text, date)
 
@@ -287,7 +390,7 @@ class BotService:
     async def _missed(self, sched: Scheduled, client: Client, reason: str) -> None:
         """Бот не встиг написати — клієнт піде в ранкові задачі Віктора."""
         self.db.update_scheduled(sched.id, status="missed", error=reason)
-        client.stage = STAGE_MISSED
+        _set_stage(client, STAGE_MISSED, self._now())
         self.db.upsert_client(client)
         self._queue_client(client)
 
@@ -330,7 +433,13 @@ class BotService:
             self.db.create_tasks(task_date, silent, now_utc.isoformat(), kind=TASK_NO_REPLY,
                                  notes={c.chat_id: "не відповів ні на привітання, ні на нагадування" for c in silent})
 
-            # 3) Коло обходу: ще не пройдені в цьому колі, найдавніший контакт — першими.
+            # 3) Пропали на курсі (після теми мовчать) — втрутитися.
+            lost, lost_notes = self._lost_candidates()
+            lost = [c for c in lost if c.chat_id not in taken]
+            taken.update(c.chat_id for c in lost)
+            self.db.create_tasks(task_date, lost, now_utc.isoformat(), kind=TASK_LOST, notes=lost_notes)
+
+            # 4) Коло обходу: ще не пройдені в цьому колі, найдавніший контакт — першими.
             cutoff = cutoff_utc(now_utc, self.cfg.tasks_min_days).isoformat()
             _, round_start = self.round_info(now_utc)
             stale = [c for c in self.db.round_candidates(cutoff, round_start, self.cfg.curator_name,
@@ -393,6 +502,17 @@ class BotService:
         alive = self.db.alive_clients(SENDER_CLIENT, (now_utc - timedelta(days=30)).isoformat())
         return build_efficiency(self.db.all_clients(include_excluded=True), self.db.all_tasks(), live, alive,
                                 rounds, now_utc, self.cfg.timezone, self.cfg.curator_name, SENDER_CLIENT)
+
+    def course_tabs(self, now_utc: datetime):
+        """(заголовок і рядки «Етапів клієнтів», дашборд «Ефективність клієнта»)."""
+        from .course import build_course_efficiency, stages_header, stages_rows
+        clients = self.db.all_clients(include_excluded=True)
+        stored = self.db.all_stages()
+        last_client = {c.chat_id: self.db.last_message_at_by(c.chat_id, (SENDER_CLIENT,))
+                       for c in clients if c.chat_id in stored or c.client_type == CLIENT_NEW}
+        self.stages_dirty = False
+        return ((stages_header(), stages_rows(clients, stored, last_client, self.cfg.timezone)),
+                build_course_efficiency(clients, stored, last_client, now_utc, self.cfg.timezone))
 
     def trends(self, now_utc: datetime):
         """Тренди по днях і тижнях для «Діаграм ефективності»."""
@@ -585,6 +705,7 @@ def client_row(client: Client, tz) -> list:
         STATUS_LABELS.get(client.status, client.status), _fmt_iso(client.partner_since, tz),
         chat_url(client.chat_id, client.username),
         _fmt_iso(client.cold_since, tz),
+        _fmt_iso(client.stage_at, tz),
     ]
 
 
@@ -601,3 +722,11 @@ def partner_row(client: Client, tz) -> list:
             _fmt_iso(client.partner_since, tz), client.client_type, _fmt_iso(client.first_seen, tz),
             _fmt_iso(client.last_message_at, tz), client.last_from or "", _fmt_iso(client.cold_since, tz),
             chat_url(client.chat_id, client.username)]
+
+
+TOPIC_LABELS = {t.label for t in TOPIC_BY_KEY.values()}
+
+
+def _set_stage(client: Client, label: str, at: datetime) -> None:
+    client.stage = label
+    client.stage_at = at.isoformat()

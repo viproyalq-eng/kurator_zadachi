@@ -131,3 +131,22 @@ def test_empty_base():
     e = build_efficiency([], [], [], 0, rounds, NOW, KYIV, CUR, CL)
     assert find(e.rows, "Прогноз завершення кола")[1] == "—"
     assert any(r[0] == "Ніхто не чекає 🎉" for r in e.rows)
+
+
+def test_trends_daily_and_weekly():
+    from bot.efficiency import TREND_DAYS, TREND_WEEKS, build_trends
+    clients = [client(1, CLIENT_NEW, welcome_sent_at=iso(30), welcome_replied_at=iso(29)),
+               client(2, status="партнер", partner_since=iso(2)),
+               client(3)]
+    tasks = [Task("2026-11-07", 3, 1, iso(24 * 400), iso(10), iso(3), done_text="+", replied_at=iso(1)),
+             Task("2026-11-07", 1, 2, iso(30), iso(10), None)]
+    msgs = [LiveMessage(1, CL, h(29), "привіт"), LiveMessage(1, CUR, h(28), "Вітаю"),
+            LiveMessage(3, CUR, h(3), "+")]
+    daily, weekly = build_trends(clients, tasks, msgs, NOW - timedelta(days=3), NOW, KYIV, CUR, CL)
+    assert len(daily) == TREND_DAYS and len(weekly) == TREND_WEEKS
+    today, yesterday = daily[-1], daily[-2]
+    assert today[0] == "07.11" and today[1] == 50 and today[4] == 100 and today[7] == 1
+    assert yesterday[2] == 60 and yesterday[5] == 1 and yesterday[6] == 1   # 1 год відповідь, 1 бонус
+    assert today[8] == 2 and daily[-5][8] == ""                              # прогрес кола; до кола — порожньо
+    week = weekly[-1]
+    assert week[0] == "02.11–08.11" and week[1] == 1 and week[6] == 100 and week[7] == 1

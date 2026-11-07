@@ -354,7 +354,8 @@ async def test_refresh_stats_writes_grid(app):
 
     app.sheets = Sheets()
     await app.refresh_stats()
-    assert written and written[0][0][0] == "Статистика куратора"
+    assert written and written[0][0][0] == "Діаграми ефективності"
+    assert any(r[0].startswith("📈 Тренди ефективності — по днях") for r in written[0])
     assert not app._stats_dirty
 
 

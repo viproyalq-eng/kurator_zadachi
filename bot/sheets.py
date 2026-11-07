@@ -235,15 +235,23 @@ class SheetWriter:
 
     # --- вкладка «Статистика» ---
     def write_stats(self, grid: list[list]) -> None:
-        """Перезаписує вкладку «Статистика» і (один раз) створює діаграми."""
-        from .stats import STATS_TAB
+        """Перезаписує вкладку «Діаграми ефективності» і додає діаграми, яких ще немає.
+        Стару вкладку «Статистика» перейменовує (її діаграми лишаються)."""
+        from .stats import OLD_STATS_TABS, STATS_TAB
         try:
             ss = self._open()
             titles = [ws.title for ws in ss.worksheets()]
             if STATS_TAB in titles:
                 ws = ss.worksheet(STATS_TAB)
+            elif any(t in titles for t in OLD_STATS_TABS):
+                ws = ss.worksheet(next(t for t in OLD_STATS_TABS if t in titles))
+                ss.batch_update({"requests": [{"updateSheetProperties": {
+                    "properties": {"sheetId": ws.id, "title": STATS_TAB}, "fields": "title"}}]})
+                ws.title = STATS_TAB
             else:
-                ws = ss.add_worksheet(title=STATS_TAB, rows=max(60, len(grid) + 5), cols=20)
+                ws = ss.add_worksheet(title=STATS_TAB, rows=max(160, len(grid) + 10), cols=20)
+            if ws.row_count < len(grid) + 5:
+                ws.add_rows(len(grid) + 20 - ws.row_count)
             ws.update(range_name="A1", values=grid, value_input_option="RAW")
             self._ensure_charts(ss, ws)
         except Exception:
@@ -252,12 +260,15 @@ class SheetWriter:
 
     def _ensure_charts(self, ss, ws) -> None:
         from .stats import chart_requests, format_requests
-        meta = ss.fetch_sheet_metadata(params={"fields": "sheets(properties(sheetId,title),charts(chartId))"})
+        meta = ss.fetch_sheet_metadata(
+            params={"fields": "sheets(properties(sheetId,title),charts(chartId,spec(title)))"})
+        existing: set[str] = set()
         for sheet in meta.get("sheets", []):
             if sheet["properties"]["sheetId"] == ws.id:
-                if sheet.get("charts"):
-                    return
-        ss.batch_update({"requests": format_requests(ws.id) + chart_requests(ws.id)})
+                existing = {c.get("spec", {}).get("title", "") for c in sheet.get("charts", [])}
+        missing = chart_requests(ws.id, existing)
+        if missing:
+            ss.batch_update({"requests": format_requests(ws.id) + missing})
 
     def _reset(self) -> None:
         self._spreadsheet = None

@@ -159,21 +159,27 @@ def build_report(clients: list[Client], tasks: list[Task], curator_msgs: list[tu
 
 
 # --- вкладка «Статистика»: фіксоване розташування (на нього посилаються діаграми) ---
-STATS_TAB = "Статистика"
+STATS_TAB = "Діаграми ефективності"
+OLD_STATS_TABS = ["Статистика"]  # стара назва — бот перейменує вкладку сам, діаграми лишаться
 COMPOSITION_FIRST_ROW = 3        # 0-based: рядок «Нові інвестори» (A4)
 COMPOSITION_ROWS = 3             # нові, старі, партнери — для кругової діаграми
 WORK_HEADER_ROW = 10             # 0-based: «Робота куратора»
 DAILY_HEADER_ROW = 20            # 0-based: заголовок таблиці по днях (A21)
 DAILY_HEADER = ["Дата", "Задач видано", "Виконано", "Клієнт відповів", "Чатів куратора",
                 "Нових клієнтів", "Нових партнерів", "Партнерів всього"]
-GRID_WIDTH = 8
+GRID_WIDTH = 9
+TRENDS_TITLE_ROW = 52             # 0-based: заголовок блоку трендів
+DAILY_TREND_ROW = 53              # 0-based: заголовок трендів по днях
+WEEKLY_TITLE_ROW = DAILY_TREND_ROW + 1 + 30 + 2
+WEEKLY_TREND_ROW = WEEKLY_TITLE_ROW + 1
 
 
-def report_grid(report: Report, tz: ZoneInfo) -> list[list]:
-    """Готова сітка значень для вкладки «Статистика» (завжди однакового розміру)."""
+def report_grid(report: Report, tz: ZoneInfo, trends: tuple[list[list], list[list]] | None = None) -> list[list]:
+    """Готова сітка значень для вкладки «Діаграми ефективності» (рядки на фіксованих місцях — на них
+    посилаються діаграми)."""
     comp = report.composition
     rows: list[list] = [
-        ["Статистика куратора", "", "Оновлено:", report.updated_at.astimezone(tz).strftime("%d.%m.%Y %H:%M")],
+        ["Діаграми ефективності", "", "Оновлено:", report.updated_at.astimezone(tz).strftime("%d.%m.%Y %H:%M")],
         [],
         ["Клієнти", "Кількість"],
         ["Нові інвестори (бонус)", comp.new_investors],
@@ -196,6 +202,19 @@ def report_grid(report: Report, tz: ZoneInfo) -> list[list]:
     for d in report.daily:
         rows.append([d["date"].strftime("%d.%m"), d["issued"], d["done"], d["replied"], d["curator_chats"],
                      d["new_clients"], d["new_partners"], d["partners_total"]])
+    if trends:
+        from .efficiency import DAILY_TREND_HEADER, WEEKLY_TREND_HEADER
+        daily, weekly = trends
+        while len(rows) < TRENDS_TITLE_ROW:
+            rows.append([])
+        rows.append(["📈 Тренди ефективності — по днях (порожньо = того дня не було даних)"])
+        rows.append(DAILY_TREND_HEADER)
+        rows.extend(daily)
+        while len(rows) < WEEKLY_TITLE_ROW:
+            rows.append([])
+        rows.append(["📈 Тренди ефективності — по тижнях (з понеділка)"])
+        rows.append(WEEKLY_TREND_HEADER)
+        rows.extend(weekly)
     return [r + [""] * (GRID_WIDTH - len(r)) for r in rows]
 
 
@@ -233,42 +252,51 @@ def _position(sheet_id: int, row: int) -> dict:
                                 "widthPixels": 560, "heightPixels": 320}}
 
 
-def chart_requests(sheet_id: int) -> list[dict]:
-    first_daily = DAILY_HEADER_ROW              # рядок заголовка (headerCount=1)
-    last_daily = DAILY_HEADER_ROW + 1 + DAILY_DAYS
+def _basic(sheet_id: int, header_row: int, n: int, chart_type: str, cols: list[int], y_title: str,
+           x_title: str = "Дата") -> dict:
+    r0, r1 = header_row, header_row + 1 + n  # з рядком заголовка (headerCount=1)
+    return {
+        "chartType": chart_type,
+        "legendPosition": "BOTTOM_LEGEND",
+        "headerCount": 1,
+        "axis": [{"position": "BOTTOM_AXIS", "title": x_title},
+                 {"position": "LEFT_AXIS", "title": y_title}],
+        "domains": [{"domain": _range(sheet_id, r0, r1, 0, 1)}],
+        "series": [{"series": _range(sheet_id, r0, r1, c, c + 1), "targetAxis": "LEFT_AXIS"} for c in cols],
+    }
 
-    def series(col: int) -> dict:
-        return {"series": _range(sheet_id, first_daily, last_daily, col, col + 1), "targetAxis": "LEFT_AXIS"}
 
-    def basic(chart_type: str, cols: list[int], title: str) -> dict:
-        return {
-            "chartType": chart_type,
-            "legendPosition": "BOTTOM_LEGEND",
-            "headerCount": 1,
-            "axis": [{"position": "BOTTOM_AXIS", "title": "Дата"},
-                     {"position": "LEFT_AXIS", "title": title}],
-            "domains": [{"domain": _range(sheet_id, first_daily, last_daily, 0, 1)}],
-            "series": [series(c) for c in cols],
-        }
-
+def chart_specs(sheet_id: int) -> list[tuple[str, dict, int]]:
+    """(назва, spec без назви, рядок прив'язки). Бот додає лише ті діаграми, яких ще немає."""
+    from .efficiency import TREND_DAYS, TREND_WEEKS
+    pie = {"pieChart": {"legendPosition": "RIGHT_LEGEND",
+                        "domain": _range(sheet_id, COMPOSITION_FIRST_ROW, COMPOSITION_FIRST_ROW + COMPOSITION_ROWS, 0, 1),
+                        "series": _range(sheet_id, COMPOSITION_FIRST_ROW, COMPOSITION_FIRST_ROW + COMPOSITION_ROWS, 1, 2)}}
+    d, w = DAILY_TREND_ROW, WEEKLY_TREND_ROW
     return [
-        {"addChart": {"chart": {
-            "spec": {"title": "Склад клієнтів",
-                     "pieChart": {"legendPosition": "RIGHT_LEGEND",
-                                  "domain": _range(sheet_id, COMPOSITION_FIRST_ROW,
-                                                   COMPOSITION_FIRST_ROW + COMPOSITION_ROWS, 0, 1),
-                                  "series": _range(sheet_id, COMPOSITION_FIRST_ROW,
-                                                   COMPOSITION_FIRST_ROW + COMPOSITION_ROWS, 1, 2)}},
-            "position": _position(sheet_id, 0)}}},
-        {"addChart": {"chart": {
-            "spec": {"title": "Задачі куратора по днях (видано / виконано / клієнт відповів)",
-                     "basicChart": basic("COLUMN", [1, 2, 3], "Задач")},
-            "position": _position(sheet_id, 17)}}},
-        {"addChart": {"chart": {
-            "spec": {"title": "Партнерів всього",
-                     "basicChart": basic("LINE", [7], "Партнерів")},
-            "position": _position(sheet_id, 34)}}},
+        ("Склад клієнтів", pie, 0),
+        ("Задачі куратора по днях (видано / виконано / клієнт відповів)",
+         {"basicChart": _basic(sheet_id, DAILY_HEADER_ROW, DAILY_DAYS, "COLUMN", [1, 2, 3], "Задач")}, 17),
+        ("Партнерів всього", {"basicChart": _basic(sheet_id, DAILY_HEADER_ROW, DAILY_DAYS, "LINE", [7], "Партнерів")}, 34),
+        ("📈 По тижнях: % виконання, % відповіли на дотик, % відповіли на привітання",
+         {"basicChart": _basic(sheet_id, w, TREND_WEEKS, "LINE", [2, 4, 6], "%", "Тиждень")}, 51),
+        ("📈 По тижнях: виконано задач і нові партнери",
+         {"basicChart": _basic(sheet_id, w, TREND_WEEKS, "COLUMN", [1, 7], "Кількість", "Тиждень")}, 68),
+        ("⏱ Середній час відповіді Віктора, хв (менше — краще)",
+         {"basicChart": _basic(sheet_id, d, TREND_DAYS, "LINE", [2], "Хвилин")}, 85),
+        ("✅ По днях: % виконання задач і % відповіли на дотик",
+         {"basicChart": _basic(sheet_id, d, TREND_DAYS, "LINE", [1, 4], "%")}, 102),
+        ("🎁 Нові клієнти по днях: бонус і відповіли на привітання",
+         {"basicChart": _basic(sheet_id, d, TREND_DAYS, "COLUMN", [5, 6], "Людей")}, 119),
+        ("🔁 Прогрес кола (пройдено наростаючим)",
+         {"basicChart": _basic(sheet_id, d, TREND_DAYS, "LINE", [8], "Пройдено")}, 136),
     ]
+
+
+def chart_requests(sheet_id: int, existing_titles: set[str] | None = None) -> list[dict]:
+    existing = existing_titles or set()
+    return [{"addChart": {"chart": {"spec": {"title": title, **spec}, "position": _position(sheet_id, row)}}}
+            for title, spec, row in chart_specs(sheet_id) if title not in existing]
 
 
 def format_requests(sheet_id: int) -> list[dict]:
@@ -284,6 +312,10 @@ def format_requests(sheet_id: int) -> list[dict]:
         bold(2, 3, 2),
         bold(WORK_HEADER_ROW, WORK_HEADER_ROW + 1, 1 + len(PERIODS)),
         bold(DAILY_HEADER_ROW, DAILY_HEADER_ROW + 1, GRID_WIDTH),
+        bold(TRENDS_TITLE_ROW, TRENDS_TITLE_ROW + 1, 1, 12),
+        bold(DAILY_TREND_ROW, DAILY_TREND_ROW + 1, GRID_WIDTH),
+        bold(WEEKLY_TITLE_ROW, WEEKLY_TITLE_ROW + 1, 1, 12),
+        bold(WEEKLY_TREND_ROW, WEEKLY_TREND_ROW + 1, GRID_WIDTH),
         {"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
             "properties": {"pixelSize": 240}, "fields": "pixelSize"}},

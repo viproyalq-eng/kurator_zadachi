@@ -65,12 +65,15 @@ class FakeSS:
     def worksheets(self):
         return list(self.tabs.values())
 
-    def worksheet(self, title):
-        return self.tabs[title]
-
     def add_worksheet(self, title, rows, cols):
         self.tabs[title] = FakeWS(title)
         return self.tabs[title]
+
+    def worksheet(self, title):
+        for ws in self.tabs.values():
+            if ws.title == title:
+                return ws
+        raise KeyError(title)
 
 
 @pytest.fixture
@@ -226,28 +229,50 @@ def test_explain_unknown():
 
 # --- вкладка «Статистика» і діаграми ---
 
-def test_write_stats_creates_charts_once(writer):
-    w, ss = writer
-    batches = []
-    charts = {}
+def _chart_api(ss):
+    """Імітація Google API для діаграм: пам'ятає назви доданих діаграм по вкладках."""
+    batches, charts = [], {}
 
     def fetch_sheet_metadata(params=None):
-        return {"sheets": [{"properties": {"sheetId": ws.id, "title": ws.title}, "charts": charts.get(ws.id, [])}
+        return {"sheets": [{"properties": {"sheetId": ws.id, "title": ws.title},
+                            "charts": [{"chartId": i, "spec": {"title": t}} for i, t in enumerate(charts.get(ws.id, []))]}
                            for ws in ss.tabs.values()]}
 
     def batch_update(body):
         batches.append(body)
-        stats_ws = ss.tabs["Статистика"]
-        charts[stats_ws.id] = [{"chartId": i} for i, r in enumerate(body["requests"]) if "addChart" in r]
+        for r in body["requests"]:
+            if "addChart" in r:
+                sid = r["addChart"]["chart"]["position"]["overlayPosition"]["anchorCell"]["sheetId"]
+                charts.setdefault(sid, []).append(r["addChart"]["chart"]["spec"]["title"])
 
     ss.fetch_sheet_metadata = fetch_sheet_metadata
     ss.batch_update = batch_update
+    return batches, charts
+
+
+def test_write_stats_creates_charts_once(writer):
+    w, ss = writer
+    batches, charts = _chart_api(ss)
     grid = [["a", 1], ["b", 2]]
     w.write_stats(grid)
     w.write_stats(grid)
-    assert ss.tabs["Статистика"].rows == grid
+    assert ss.tabs["Діаграми ефективності"].rows == grid
     assert len(batches) == 1
-    assert sum("addChart" in r for r in batches[0]["requests"]) == 3
+    assert sum("addChart" in r for r in batches[0]["requests"]) == 9
+
+
+def test_old_statistics_tab_is_renamed_and_only_new_charts_added(writer):
+    from bot.stats import chart_specs
+    w, ss = writer
+    batches, charts = _chart_api(ss)
+    old = ss.add_worksheet("Статистика", 60, 20)
+    old.row_count = 60
+    charts[old.id] = [t for t, _, _ in chart_specs(old.id)[:3]]   # три старі діаграми вже є
+    w.write_stats([["x"]] * 120)
+    renames = [r for b in batches for r in b["requests"] if "updateSheetProperties" in r]
+    assert renames and renames[0]["updateSheetProperties"]["properties"]["title"] == "Діаграми ефективності"
+    assert old.row_count >= 125                        # рядків вистачає для трендів
+    assert len(charts[old.id]) == 9                    # додано лише 6 нових, без дублів
 
 
 def test_partner_columns_updated_but_not_client_kept(writer):

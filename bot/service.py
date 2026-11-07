@@ -394,6 +394,18 @@ class BotService:
         return build_efficiency(self.db.all_clients(include_excluded=True), self.db.all_tasks(), live, alive,
                                 rounds, now_utc, self.cfg.timezone, self.cfg.curator_name, SENDER_CLIENT)
 
+    def trends(self, now_utc: datetime):
+        """Тренди по днях і тижнях для «Діаграм ефективності»."""
+        from .efficiency import LiveMessage, build_trends
+        from .stats import BOT_STARTED_KEY
+        since = self.db.get_setting(BOT_STARTED_KEY)
+        live = [LiveMessage(cid, sender, datetime.fromisoformat(d), text or "")
+                for cid, sender, d, text in self.db.live_messages(since)]
+        _, start = self.round_info(now_utc)
+        return build_trends(self.db.all_clients(include_excluded=True), self.db.all_tasks(), live,
+                            datetime.fromisoformat(start), now_utc, self.cfg.timezone,
+                            self.cfg.curator_name, SENDER_CLIENT)
+
     def apply_not_client_flags(self, flags: dict[int, bool]) -> int:
         """Переносить позначки «Не клієнт» з таблиці в базу. Повертає, скільки змінилося."""
         changed = 0

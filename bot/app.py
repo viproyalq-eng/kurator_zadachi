@@ -491,7 +491,8 @@ class BotApp:
         self._stats_dirty = False
         if not self.sheets:
             return
-        grid = report_grid(self._build_report(), self.cfg.timezone)
+        now = datetime.now(timezone.utc)
+        grid = report_grid(self._build_report(), self.cfg.timezone, self.service.trends(now))
         cold_rows = [cold_row(c, self.cfg.timezone) for c in self.db.cold_clients() if not c.excluded]
         partner_rows = [partner_row(c, self.cfg.timezone) for c in self.db.partner_clients()]
         open_rows, done_rows = self.service.task_lists()
@@ -504,8 +505,8 @@ class BotApp:
             await asyncio.to_thread(self.sheets.write_partner_list, partner_rows)
             await asyncio.to_thread(self.sheets.write_cold_list, cold_rows)
         except Exception as e:  # noqa: BLE001
-            log.exception("Не вдалося оновити вкладку «Статистика»")
-            await self.notifier.notify(f"⚠️ Не вдалося оновити вкладку «Статистика».\n{self._explain_sheets(e)}",
+            log.exception("Не вдалося оновити вкладки статистики")
+            await self.notifier.notify(f"⚠️ Не вдалося оновити вкладки статистики.\n{self._explain_sheets(e)}",
                                        key="stats", cooldown=SHEETS_ERROR_COOLDOWN)
 
     # --- імпорт старих чатів ---

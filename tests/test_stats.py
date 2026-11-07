@@ -75,11 +75,13 @@ def test_grid_layout_matches_charts():
     assert all(len(r) == GRID_WIDTH for r in grid)
     assert grid[COMPOSITION_FIRST_ROW][0].startswith("Нові інвестори")
     assert grid[COMPOSITION_FIRST_ROW + 2][0] == "Партнери"
-    assert grid[DAILY_HEADER_ROW] == DAILY_HEADER
+    assert grid[DAILY_HEADER_ROW][:len(DAILY_HEADER)] == DAILY_HEADER
     assert len(grid) == DAILY_HEADER_ROW + 1 + 30
     assert grid[13][0] == "% виконання" and grid[13][1] == "67%"
     reqs = chart_requests(42)
-    assert len(reqs) == 3
+    assert len(reqs) == 9
+    titles = [r["addChart"]["chart"]["spec"]["title"] for r in reqs]
+    assert chart_requests(42, set(titles[:3])) and len(chart_requests(42, set(titles[:3]))) == 6
     pie = reqs[0]["addChart"]["chart"]["spec"]["pieChart"]["domain"]["sourceRange"]["sources"][0]
     assert (pie["startRowIndex"], pie["endRowIndex"]) == (COMPOSITION_FIRST_ROW, COMPOSITION_FIRST_ROW + 3)
     col = reqs[1]["addChart"]["chart"]["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"][0]
@@ -89,3 +91,16 @@ def test_grid_layout_matches_charts():
 def test_summary_text():
     text = summary_text(make_report())
     assert "партнерів 2" in text and "Сьогодні: задачі 2/3 (67%)" in text
+
+
+
+def test_grid_with_trends_matches_chart_rows():
+    from bot.efficiency import DAILY_TREND_HEADER, WEEKLY_TREND_HEADER
+    from bot.stats import DAILY_TREND_ROW, WEEKLY_TREND_ROW
+    daily = [[f"{i:02d}.11", 50, 30, 2, 40, 1, 1, 0, i] for i in range(30)]
+    weekly = [[f"w{i}", 10, 80, 45, 50, 3, 66, 1] for i in range(12)]
+    grid = report_grid(make_report(), KYIV, (daily, weekly))
+    assert grid[DAILY_TREND_ROW][:9] == DAILY_TREND_HEADER
+    assert grid[DAILY_TREND_ROW + 1][0] == "00.11" and grid[DAILY_TREND_ROW + 30][0] == "29.11"
+    assert grid[WEEKLY_TREND_ROW][:8] == WEEKLY_TREND_HEADER and grid[WEEKLY_TREND_ROW + 12][0] == "w11"
+    assert all(len(r) == GRID_WIDTH for r in grid)

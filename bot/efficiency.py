@@ -290,3 +290,76 @@ def build_efficiency(clients: list[Client], tasks: list[Task], messages: list[Li
              fmt_minutes((now_utc - since).total_seconds() / 60),
              chat_url(c.chat_id, c.username), "", (waiting[chat_id][1] or "")[:200]])
     return rep
+
+
+# --- тренди для «Діаграм ефективності» ---
+TREND_DAYS = 30
+TREND_WEEKS = 12
+DAILY_TREND_HEADER = ["Дата", "% виконання задач", "Сер. час відповіді (хв)", "Відповідей клієнтам",
+                      "% відповіли на дотик", "Нових (бонус)", "Відповіли на привітання", "Короткі дотики",
+                      "Пройдено в колі (наростаючим)"]
+WEEKLY_TREND_HEADER = ["Тиждень", "Виконано задач", "% виконання", "Сер. час відповіді (хв)",
+                       "% відповіли на дотик", "Нових (бонус)", "% відповіли на привітання", "Нових партнерів"]
+
+
+def _pct_num(part: int, whole: int):
+    return round(100 * part / whole) if whole else ""
+
+
+def _mean_num(values: list[float]):
+    return round(statistics.mean(values)) if values else ""
+
+
+def build_trends(clients: list[Client], tasks: list[Task], messages: list[LiveMessage], round_start: datetime,
+                 now_utc: datetime, tz: ZoneInfo, curator: str, client_sender: str
+                 ) -> tuple[list[list], list[list]]:
+    """Рядки трендів: по днях (останні 30) і по тижнях (останні 12, з понеділка).
+    Порожня клітинка — у той день/тиждень не було даних (лінія діаграми не падає в нуль)."""
+    today = now_utc.astimezone(tz).date()
+    active = [c for c in clients if not c.excluded]
+    active_ids = {c.chat_id for c in active}
+    live = [m for m in messages if m.chat_id in active_ids]
+    pairs, _ = response_times(live, curator, client_sender)
+
+    def collect(start: date, end: date) -> dict:
+        issued = [t for t in tasks if start <= date.fromisoformat(t.task_date) <= end]
+        done_by_task_date = [t for t in issued if t.done_at]
+        done = [t for t in tasks if t.done_at and _in(_local_date(t.done_at, tz), start, end)]
+        resp = [(e - s).total_seconds() / 60 for s, e in pairs if _in(e.astimezone(tz).date(), start, end)]
+        bonus = [c for c in active if c.client_type == CLIENT_NEW and _in(_local_date(c.welcome_sent_at, tz), start, end)]
+        return {
+            "issued": len(issued), "done_pct": _pct_num(len(done_by_task_date), len(issued)),
+            "resp_avg": _mean_num(resp), "resp_n": len(resp),
+            "done": len(done), "touch_reply_pct": _pct_num(sum(1 for t in done if t.replied_at), len(done)),
+            "short": sum(1 for t in done if len((t.done_text or "").strip()) < SHORT_TOUCH_CHARS),
+            "bonus": len(bonus), "bonus_replied": sum(1 for c in bonus if c.welcome_replied_at),
+            "partners": sum(1 for c in active if c.status == STATUS_PARTNER
+                            and _in(_local_date(c.partner_since, tz), start, end)),
+        }
+
+    # Прогрес кола: коли кожен клієнт кола вперше отримав повідомлення Віктора після старту кола.
+    pool = {c.chat_id for c in active if not c.cold_since and c.status != STATUS_PARTNER}
+    first_touch: dict[int, date] = {}
+    for m in sorted(live, key=lambda m: m.date):
+        if m.sender == curator and m.chat_id in pool and m.date > round_start and m.chat_id not in first_touch:
+            first_touch[m.chat_id] = m.date.astimezone(tz).date()
+    round_day = round_start.astimezone(tz).date()
+
+    daily = []
+    for i in range(TREND_DAYS - 1, -1, -1):
+        d = today - timedelta(days=i)
+        v = collect(d, d)
+        covered = sum(1 for fd in first_touch.values() if fd <= d) if d >= round_day else ""
+        daily.append([d.strftime("%d.%m"), v["done_pct"], v["resp_avg"], v["resp_n"], v["touch_reply_pct"],
+                      v["bonus"], v["bonus_replied"], v["short"], covered])
+
+    weekly = []
+    monday = today - timedelta(days=today.weekday())
+    for i in range(TREND_WEEKS - 1, -1, -1):
+        start = monday - timedelta(weeks=i)
+        end = start + timedelta(days=6)
+        v = collect(start, end)
+        weekly.append([f"{start.strftime('%d.%m')}–{end.strftime('%d.%m')}", v["done"], v["done_pct"],
+                       v["resp_avg"], v["touch_reply_pct"], v["bonus"],
+                       _pct_num(v["bonus_replied"], v["bonus"]), v["partners"]])
+    return daily, weekly

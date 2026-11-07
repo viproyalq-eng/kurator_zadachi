@@ -26,6 +26,9 @@ STAGE_REMINDER_SENT = "нагадування надіслано"
 STAGE_REPLIED = "відповів на привітання"
 STAGE_MISSED = "бот не встиг написати — задача Віктору"
 
+ROUND_NO_KEY = "round_no"
+ROUND_START_KEY = "round_started_at"
+
 TASK_STALE = "stale"
 TASK_MISSED = "missed"
 TASK_NO_REPLY = "no_reply"
@@ -154,6 +157,8 @@ class BotService:
             for task in self.db.mark_tasks_done(client.chat_id, msg.date.isoformat(), msg.text):
                 self._queue_task(task)
             self.db.cancel_scheduled(client.chat_id, (KIND_WELCOME, KIND_REMINDER))
+            if self.db.get_setting(ROUND_START_KEY):
+                await self.maybe_finish_round(self._now())
         elif sender == SENDER_CLIENT:
             # Клієнт відповів після дотику — це ознака, що дотик був справжнім.
             for task in self.db.mark_tasks_replied(client.chat_id, msg.date.isoformat()):
@@ -323,14 +328,51 @@ class BotService:
             self.db.create_tasks(task_date, silent, now_utc.isoformat(), kind=TASK_NO_REPLY,
                                  notes={c.chat_id: "не відповів ні на привітання, ні на нагадування" for c in silent})
 
-            # 3) Давно не спілкувалися — найстаріші першими.
+            # 3) Коло обходу: ще не пройдені в цьому колі, найдавніший контакт — першими.
             cutoff = cutoff_utc(now_utc, self.cfg.tasks_min_days).isoformat()
-            stale = [c for c in self.db.task_candidates(cutoff, self.cfg.tasks_per_day + len(taken))
+            _, round_start = self.round_info(now_utc)
+            stale = [c for c in self.db.round_candidates(cutoff, round_start, self.cfg.curator_name,
+                                                         self.cfg.tasks_per_day + len(taken))
                      if c.chat_id not in taken][:self.cfg.tasks_per_day]
             self.db.create_tasks(task_date, stale, now_utc.isoformat(), kind=TASK_STALE)
             for task in self.db.tasks_for(task_date):
                 self._queue_task(task)
         return self.db.tasks_for(task_date)
+
+    # --- кола обходу ---
+    def round_info(self, now_utc: datetime) -> tuple[int, str]:
+        """(номер кола, коли почалося). Перше коло починається при першому зверненні."""
+        number = self.db.get_setting(ROUND_NO_KEY)
+        start = self.db.get_setting(ROUND_START_KEY)
+        if not number or not start:
+            number, start = "1", now_utc.isoformat()
+            self.db.set_setting(ROUND_NO_KEY, number)
+            self.db.set_setting(ROUND_START_KEY, start)
+        return int(number), start
+
+    def round_progress(self, now_utc: datetime) -> tuple[int, int, int]:
+        """(номер кола, пройдено, усього)."""
+        number, start = self.round_info(now_utc)
+        covered, total = self.db.round_progress(start, self.cfg.curator_name)
+        return number, covered, total
+
+    async def maybe_finish_round(self, now_utc: datetime) -> bool:
+        """Якщо в колі пройдено всіх — повідомляє групу і починає нове коло."""
+        number, start = self.round_info(now_utc)
+        covered, total = self.db.round_progress(start, self.cfg.curator_name)
+        if total == 0 or covered < total:
+            return False
+        days = max(1, (now_utc - datetime.fromisoformat(start)).days)
+        self.db.set_setting(ROUND_NO_KEY, str(number + 1))
+        self.db.set_setting(ROUND_START_KEY, now_utc.isoformat())
+        if self.notify_group:
+            await self.notify_group(
+                f"🎉 <b>Усіх клієнтів пройдено!</b>\n"
+                f"Коло №{number} завершено: {total} клієнтів за {days} дн.\n\n"
+                f"Починаємо коло №{number + 1} — знову по {self.cfg.tasks_per_day} на день, від найдавнішого "
+                f"контакту (кому писали менше {self.cfg.tasks_min_days} днів тому — трохи пізніше). "
+                f"Партнерів і холодних у колі немає.")
+        return True
 
     def apply_not_client_flags(self, flags: dict[int, bool]) -> int:
         """Переносить позначки «Не клієнт» з таблиці в базу. Повертає, скільки змінилося."""
@@ -382,7 +424,8 @@ class BotService:
             if report.oldest_contact is None or client.last_message_at < report.oldest_contact:
                 report.oldest_contact = client.last_message_at
         cutoff = cutoff_utc(now, self.cfg.tasks_min_days).isoformat()
-        report.ready_for_tasks = len(self.db.task_candidates(cutoff, 10 ** 9))
+        _, round_start = self.round_info(now)
+        report.ready_for_tasks = len(self.db.round_candidates(cutoff, round_start, self.cfg.curator_name, 10 ** 9))
         return report
 
     # --- партнери ---

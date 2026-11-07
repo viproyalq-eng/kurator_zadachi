@@ -209,11 +209,13 @@ class BotApp:
         await self._sync_not_client_flags()
         now = datetime.now(timezone.utc)
         today = self._today_local()
+        await self.service.maybe_finish_round(now)
         tasks = self.service.create_daily_tasks(today.isoformat(), now)
         y_tasks = self.db.tasks_for((today - timedelta(days=1)).isoformat())
         yesterday = (sum(1 for t in y_tasks if t.done_at), len(y_tasks)) if y_tasks else None
         text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days,
-                                    yesterday=yesterday, header=header, tz=self.cfg.timezone)
+                                    yesterday=yesterday, header=header, tz=self.cfg.timezone,
+                                    round_progress=self.service.round_progress(now))
         await self.send_to_tasks_chat(text)
 
     async def _scheduler_loop(self) -> None:
@@ -340,7 +342,8 @@ class BotApp:
         now = datetime.now(timezone.utc)
         today = self._today_local()
         tasks = self.service.create_daily_tasks(today.isoformat(), now)
-        text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days, tz=self.cfg.timezone)
+        text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days, tz=self.cfg.timezone,
+                                    round_progress=self.service.round_progress(now))
         await update.message.reply_html(text, disable_web_page_preview=True)
 
     # --- партнери ---
@@ -615,6 +618,7 @@ class BotApp:
         tasks_line = (f"група {tasks_chat}" if tasks_chat else "група НЕ задана (TASKS_CHAT_ID) — шлю адмінам")
         today_tasks = self.db.tasks_for(self._today_local().isoformat())
         done = sum(1 for t in today_tasks if t.done_at)
+        round_no, covered, total = self.service.round_progress(datetime.now(timezone.utc))
         await update.message.reply_text(
             "📊 Стан бота\n"
             f"Клієнтів: {s['clients']} (нових {s['new_clients']}, старих {s['old_clients']}, "
@@ -626,6 +630,7 @@ class BotApp:
             f"Задачі: щодня о {self.cfg.tasks_time.strftime('%H:%M')} ({self.cfg.tasks_per_day} шт., "
             f"без контакту {self.cfg.tasks_min_days}+ днів), {tasks_line}\n"
             f"Сьогодні виконано: {done} з {len(today_tasks)}\n"
+            f"Коло №{round_no}: пройдено {covered} з {total}\n"
             f"Заплановано повідомлень клієнтам: {len(self.db.scheduled(status='pending'))}")
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

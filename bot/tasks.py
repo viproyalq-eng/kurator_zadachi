@@ -86,11 +86,15 @@ def ordered_tasks(tasks: list[Task]) -> list[Task]:
 
 def format_tasks_message(task_date: str, tasks: list[Task], now_utc: datetime, min_days: int,
                          yesterday: tuple[int, int] | None = None, header: str | None = None,
-                         tz: ZoneInfo = ZoneInfo("Europe/Kyiv")) -> str:
+                         tz: ZoneInfo = ZoneInfo("Europe/Kyiv"),
+                         round_progress: tuple[int, int, int] | None = None) -> str:
     """Текст для групи «Задачі куратора» (HTML), розбитий на розділи за типом задачі."""
     lines = [header or f"☀️ <b>Задачі на {fmt_date(task_date)}</b>"]
     if yesterday and yesterday[1]:
         lines.append(f"Вчора виконано: {yesterday[0]} з {yesterday[1]}")
+    if round_progress and round_progress[2]:
+        number, covered, total = round_progress
+        lines.append(f"🔁 Коло №{number}: пройдено {covered} з {total} клієнтів (залишилось {total - covered})")
     lines.append("")
     if not tasks:
         lines.append(f"Сьогодні немає клієнтів, з якими не спілкувалися {min_days}+ днів 🎉")

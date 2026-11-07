@@ -467,3 +467,9 @@ async def test_cold_list_written_to_sheet(app):
     p = written["partners"]
     assert len(p) == 1 and p[0][0] == "Andriy B." and p[0][1] == "@andriy_b"
     assert p[0][3] == "07.11.2026 11:00" and p[0][4] == "новий" and p[0][9] == "https://t.me/andriy_b"
+
+
+async def test_status_shows_round(app):
+    rec = Recorder()
+    await app.cmd_status(command_update(rec, 1, 1), SimpleNamespace(args=[]))
+    assert "Коло №1: пройдено 0 з 0" in rec.replies[-1] and "Таблиця" in rec.replies[-1]

@@ -294,6 +294,25 @@ class Database:
         self.conn.commit()
 
     # --- задачі ---
+    # --- кола обходу: інвестори (нові й старі), без партнерів, холодних і «не клієнтів» ---
+    _ROUND_POOL = f"c.excluded=0 AND c.cold_since IS NULL AND c.status <> '{STATUS_PARTNER}'"
+    _COVERED = "EXISTS (SELECT 1 FROM messages m WHERE m.chat_id=c.chat_id AND m.sender=? AND m.date > ?)"
+
+    def round_candidates(self, cutoff_iso: str, round_start_iso: str, curator: str, limit: int) -> list[Client]:
+        """Ще не пройдені в цьому колі (Віктор їм не писав), без контакту з cutoff — найстаріші першими."""
+        rows = self.conn.execute(
+            f"""SELECT * FROM clients c WHERE {self._ROUND_POOL} AND NOT {self._COVERED}
+                AND c.last_message_at IS NOT NULL AND c.last_message_at <= ?
+                ORDER BY c.last_message_at ASC LIMIT ?""", (curator, round_start_iso, cutoff_iso, limit))
+        return [Client(**dict(r)) for r in rows]
+
+    def round_progress(self, round_start_iso: str, curator: str) -> tuple[int, int]:
+        """(пройдено в цьому колі, усього в колі)."""
+        total = self.conn.execute(f"SELECT COUNT(*) FROM clients c WHERE {self._ROUND_POOL}").fetchone()[0]
+        covered = self.conn.execute(f"SELECT COUNT(*) FROM clients c WHERE {self._ROUND_POOL} AND {self._COVERED}",
+                                    (curator, round_start_iso)).fetchone()[0]
+        return covered, total
+
     def task_candidates(self, cutoff_iso: str, limit: int) -> list[Client]:
         """Клієнти, з якими не було жодного повідомлення з моменту cutoff — найстаріші першими."""
         rows = self.conn.execute(

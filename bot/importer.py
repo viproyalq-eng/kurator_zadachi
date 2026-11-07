@@ -73,10 +73,15 @@ def load_bytes(data: bytes, filename: str = "") -> dict:
 
 
 def _text(value) -> str:
+    """Текст повідомлення. Посилання, «сховані» під словом (text_link → href), дописуємо в кінець —
+    інакше не видно, яке відео надіслано."""
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        return "".join(p if isinstance(p, str) else str(p.get("text", "")) for p in value)
+        text = "".join(p if isinstance(p, str) else str(p.get("text", "")) for p in value)
+        hidden = [str(p["href"]) for p in value if isinstance(p, dict) and p.get("href")]
+        extra = [h for h in hidden if h not in text]
+        return f"{text} {' '.join(extra)}".strip() if extra else text
     return ""
 
 

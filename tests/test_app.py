@@ -115,7 +115,7 @@ async def test_commands(app):
 
 
 async def test_handlers_registered(app):
-    assert len(app.application.handlers[0]) == 20
+    assert len(app.application.handlers[0]) == 21
 
 
 async def test_sheet_failure_notifies_once_then_recovers(app):

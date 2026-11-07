@@ -267,3 +267,53 @@ def course_chart_specs(sheet_id: int) -> list[tuple[str, dict, int]]:
         ("🕳 Де пропадають (зараз мовчать після теми)",
          {"basicChart": _basic(sheet_id, FUNNEL_HEADER_ROW, n, "COLUMN", [8], "Людей", "Етап")}, 36),
     ]
+
+
+
+# --- діагностика: які відео Віктор надсилав і чи бот їх упізнає ---
+def course_check(curator_texts: list[tuple[int, str, str]], tz: ZoneInfo, top: int = 15) -> str:
+    """Звіт для /coursecheck. curator_texts: (chat_id, дата, текст) усіх повідомлень куратора."""
+    known_ids = {v for t in TOPICS for v in t.video_ids}
+    total = with_yt = recognized = 0
+    unknown: dict[str, list] = {}
+    clients_with_topics: set[int] = set()
+    for chat_id, date, text in curator_texts:
+        total += 1
+        ids = _YT_ID.findall(text or "")
+        if detect_topics(text):
+            recognized += 1
+            clients_with_topics.add(chat_id)
+        if not ids:
+            continue
+        with_yt += 1
+        for vid in ids:
+            if vid in known_ids:
+                continue
+            info = unknown.setdefault(vid, [0, set(), date, date, (text or "").strip()])
+            info[0] += 1
+            info[1].add(chat_id)
+            info[2], info[3] = min(info[2], date), max(info[3], date)
+    lines = [
+        "🔎 <b>Перевірка тем курсу в переписках</b>",
+        f"Повідомлень Віктора в базі: {total}",
+        f"…з посиланням на YouTube: {with_yt}",
+        f"…упізнано як тему курсу: {recognized} (у {len(clients_with_topics)} клієнтів)",
+        "",
+    ]
+    if not unknown:
+        lines.append("Невідомих відео немає ✅")
+    else:
+        lines.append(f"<b>Невідомі відео</b> (бот не знає, яка це тема) — топ {min(top, len(unknown))} з {len(unknown)}:")
+        for vid, (n, chats, first, last, sample) in sorted(unknown.items(), key=lambda x: -x[1][0])[:top]:
+            d1 = datetime.fromisoformat(first).astimezone(tz).strftime("%d.%m.%y")
+            d2 = datetime.fromisoformat(last).astimezone(tz).strftime("%d.%m.%y")
+            snippet = " ".join(sample.split())[:70]
+            lines.append(f"• <code>{vid}</code> — {n} раз, {len(chats)} клієнтам, {d1}–{d2}\n   «{_html(snippet)}»")
+        lines.append("")
+        lines.append("Напишіть, яка тема кожне з цих відео — я додам їх, і бот перерахує етапи.")
+    return "\n".join(lines)
+
+
+def _html(text: str) -> str:
+    import html
+    return html.escape(text)

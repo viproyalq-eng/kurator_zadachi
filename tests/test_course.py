@@ -177,3 +177,41 @@ async def test_partner_stage_from_manual_status(tmp_path):
     row = dict(zip(stages_header(), stages_rows(e.db.all_clients(), e.db.all_stages(), {}, KYIV)[0]))
     assert row["Партнер"].startswith("✅")
     assert await e.service.check_lost(day(9)) == 0       # партнерів «пропав» не стосується
+
+
+def test_hidden_link_in_live_message_is_seen():
+    from types import SimpleNamespace
+    from bot.logic import message_text
+    msg = SimpleNamespace(text="Тема 3: Видео", caption=None,
+                          entities=[SimpleNamespace(type="text_link", url="https://youtu.be/DYSB1DXN2So")])
+    text = message_text(msg)
+    assert text == "Тема 3: Видео https://youtu.be/DYSB1DXN2So" and detect_topics(text) == ["t3"]
+
+
+def test_hidden_link_in_export_and_reimport_updates_stages(tmp_path):
+    from bot.importer import parse_export
+    data = {"personal_information": {"user_id": VIKTOR}, "chats": {"list": [
+        {"name": "Олег", "type": "personal_chat", "id": 300, "messages": [
+            {"id": 1, "type": "message", "date_unixtime": "1700000000", "from_id": "user300", "text": "бонус"},
+            {"id": 2, "type": "message", "date_unixtime": "1700003600", "from_id": f"user{VIKTOR}",
+             "text": ["Тема 1: ", {"type": "text_link", "text": "Видео", "href": "https://youtu.be/wWj68CilMN0"}]},
+        ]}]}}
+    export = parse_export(data, KYIV)
+    assert export.chats[0].messages[1].text == "Тема 1: Видео https://youtu.be/wWj68CilMN0"
+    e = Env(tmp_path)
+    # перший імпорт старою версією зберіг текст без посилання
+    e.db.add_messages_bulk([(300, 2, None, "Віктор", "Тема 1: Видео", "2023-11-14T23:13:20+00:00")])
+    report = e.service.import_export(export, None, T0)
+    assert report.course_clients == {300} and "t1" in e.db.stages_of(300)
+    assert "youtu.be" in e.db.curator_texts("Віктор")[0][2]      # текст у базі виправлено
+
+
+def test_course_check_lists_unknown_videos():
+    from bot.course import course_check
+    texts = [(1, "2025-01-10T10:00:00+00:00", "Тема 1 https://youtu.be/wWj68CilMN0"),
+             (2, "2025-01-11T10:00:00+00:00", "Тема 1 (старое видео) https://youtu.be/OLDvideo001"),
+             (3, "2025-02-11T10:00:00+00:00", "Тема 1 (старое видео) https://youtu.be/OLDvideo001"),
+             (3, "2025-02-12T10:00:00+00:00", "Добрый день!")]
+    report = course_check(texts, KYIV)
+    assert "з посиланням на YouTube: 3" in report and "упізнано як тему курсу: 1 (у 1 клієнтів)" in report
+    assert "<code>OLDvideo001</code> — 2 раз, 2 клієнтам, 11.01.25–11.02.25" in report

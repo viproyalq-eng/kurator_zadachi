@@ -479,13 +479,16 @@ class Database:
         self.conn.commit()
 
     def add_messages_bulk(self, rows: list[tuple]) -> int:
-        """rows: (chat_id, message_id, connection_id, sender, text, date_iso). Повертає, скільки додано нових."""
-        before = self.conn.total_changes
+        """rows: (chat_id, message_id, connection_id, sender, text, date_iso). Повертає, скільки додано нових.
+        Якщо повідомлення вже є — оновлюємо лише текст (повторний імпорт дописує «сховані» посилання)."""
+        before = self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         self.conn.executemany(
-            """INSERT OR IGNORE INTO messages (chat_id, message_id, business_connection_id, sender, text, date)
-               VALUES (?, ?, ?, ?, ?, ?)""", rows)
+            """INSERT INTO messages (chat_id, message_id, business_connection_id, sender, text, date)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(chat_id, message_id) DO UPDATE SET text=excluded.text
+               WHERE messages.text IS NOT excluded.text""", rows)
         self.conn.commit()
-        return self.conn.total_changes - before
+        return self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] - before
 
     def live_messages(self, since_iso: str | None) -> list[tuple[int, str, str, str]]:
         """(chat_id, sender, date, text) — повідомлення від запуску бота, по чатах і в часі."""

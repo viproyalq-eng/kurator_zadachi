@@ -5,7 +5,7 @@ import html
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
@@ -91,6 +91,7 @@ class ImportReport:
     skipped_other: int = 0
     oldest_contact: str | None = None
     ready_for_tasks: int = 0
+    course_clients: set = field(default_factory=set)   # у кого знайдено теми курсу
 
 
 class BotService:
@@ -546,6 +547,12 @@ class BotService:
                               skipped_other=export.skipped_other)
         self.db.exclude_usernames(self.cfg.team_usernames)
         for chat in export.chats:
+            # Теми курсу шукаємо в усіх повідомленнях Віктора з файлу (навіть новіших за запуск бота).
+            for m in chat.messages:
+                if m.from_owner:
+                    for key in detect_topics(m.text):
+                        self.db.record_stage(chat.chat_id, key, m.date.isoformat())
+                        report.course_clients.add(chat.chat_id)
             msgs = [m for m in chat.messages if before is None or m.date < before]
             if not msgs:
                 continue

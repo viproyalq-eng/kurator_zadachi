@@ -51,13 +51,24 @@ MEDIA_LABELS = [
 ]
 
 
+def _hidden_links(message, text: str) -> str:
+    """Посилання, «сховані» під словом (синє «Видео»), Telegram передає окремо від тексту — дописуємо їх."""
+    urls = []
+    for attr in ("entities", "caption_entities"):
+        for e in getattr(message, attr, None) or ():
+            url = getattr(e, "url", None)
+            if getattr(e, "type", None) == "text_link" and url and url not in text and url not in urls:
+                urls.append(url)
+    return f"{text} {' '.join(urls)}".strip() if urls else text
+
+
 def message_text(message) -> str:
     """Текст повідомлення; для медіа — мітка типу плюс підпис, якщо є."""
     text = getattr(message, "text", None)
     if text:
-        return text
+        return _hidden_links(message, text)
     caption = getattr(message, "caption", None) or ""
     for attr, label in MEDIA_LABELS:
         if getattr(message, attr, None):
-            return f"{label} {caption}".strip()
-    return caption or "[інше]"
+            return _hidden_links(message, f"{label} {caption}".strip())
+    return _hidden_links(message, caption) or "[інше]"

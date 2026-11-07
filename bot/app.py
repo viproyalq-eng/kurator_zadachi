@@ -23,7 +23,7 @@ from .service import BotService, IncomingMessage, cold_row, partner_row
 from .sheets import SheetWriter, explain_error
 from .backup import (LAST_BACKUP_KEY, TELEGRAM_SEND_LIMIT, BackupError, extract_backup, is_backup_name,
                      make_backup, replace_database, rotate)
-from .course import COURSE_TAB, course_chart_specs
+from .course import COURSE_TAB, course_chart_specs, course_check
 from .efficiency import EFFICIENCY_TAB
 from .importer import ImportError_, load_bytes, parse_export
 from .stats import BOT_STARTED_KEY, build_report, report_grid, summary_text
@@ -181,6 +181,17 @@ class BotApp:
         if not self.cfg.backup_recipients:
             log.warning("Немає кому надсилати бекап: задайте ADMIN_CHAT_ID або BACKUP_CHAT_ID")
         return sent
+
+    async def cmd_coursecheck(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id not in self.cfg.admin_chat_ids:
+            await update.message.reply_text("Лише для адмінів.")
+            return
+        updated = self.service.rescan_course_history()
+        report = course_check(self.db.curator_texts(self.cfg.curator_name), self.cfg.timezone)
+        if updated:
+            report += f"\n\nЩойно оновлено етапи у {updated} клієнтів."
+        await update.message.reply_html(report[:4000], disable_web_page_preview=True)
 
     async def cmd_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._can_backup(update.effective_user.id if update.effective_user else None):
@@ -401,6 +412,7 @@ class BotApp:
         app.add_handler(CommandHandler("stats", self.cmd_stats, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CommandHandler("import", self.cmd_import, filters=PRIVATE_ONLY))
         app.add_handler(CommandHandler("backup", self.cmd_backup, filters=PRIVATE_ONLY))
+        app.add_handler(CommandHandler("coursecheck", self.cmd_coursecheck, filters=filters.UpdateType.MESSAGE))
         app.add_handler(CallbackQueryHandler(self.on_restore_button, pattern=r"^restore:(yes|no)$"))
         app.add_handler(MessageHandler(PRIVATE_ONLY & filters.Document.ALL, self.on_document))
         app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND,
@@ -698,7 +710,7 @@ class BotApp:
         started = self.db.get_setting(BOT_STARTED_KEY)
         before = datetime.fromisoformat(started) if started else None
         report = self.service.import_export(export, before, datetime.now(timezone.utc))
-        course_updated = self.service.rescan_course_history()
+        self.service.rescan_course_history()
         self._stats_dirty = True
         oldest = (fmt_date(datetime.fromisoformat(report.oldest_contact).astimezone(self.cfg.timezone).date())
                   if report.oldest_contact else "—")
@@ -712,7 +724,7 @@ class BotApp:
             f"Найдавніший контакт: {oldest}\n"
             f"Готові до задач ({self.cfg.tasks_min_days}+ днів без контакту): {report.ready_for_tasks} — "
             f"щоранку по {self.cfg.tasks_per_day}.\n"
-            f"Етапи курсу знайдено в переписках: {course_updated} клієнтів (вкладка «Етапи клієнтів»).\n\n"
+            f"Теми курсу знайдено в переписках: {len(report.course_clients)} клієнтів (вкладка «Етапи клієнтів»).\n\n"
             "Далі: відкрийте в таблиці вкладку «Клієнти» і поставте «так» у стовпці «Не клієнт» "
             "друзям, рідним і колегам — у задачі вони не потраплятимуть.")
         if export.owner_id is None and owner is None:

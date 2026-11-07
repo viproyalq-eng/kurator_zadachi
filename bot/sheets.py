@@ -214,6 +214,25 @@ class SheetWriter:
         self.write_list(TASKS_TAB, TASKS_HEADER, open_rows)
         self.write_list(DONE_TASKS_TAB, TASKS_HEADER, done_rows)
 
+    # --- вкладка «Ефективність куратора» (переписується цілком, з оформленням) ---
+    def write_dashboard(self, title: str, rows: list[list], styles: list[tuple[int, str]]) -> None:
+        try:
+            ss = self._open()
+            titles = [ws.title for ws in ss.worksheets()]
+            width = max((len(r) for r in rows), default=1)
+            if title in titles:
+                ws = ss.worksheet(title)
+                ws.clear()
+            else:
+                ws = ss.add_worksheet(title=title, rows=max(200, len(rows) + 50), cols=max(width, 8))
+            if ws.row_count < len(rows) + 10:
+                ws.add_rows(len(rows) + 50 - ws.row_count)
+            ws.update(range_name="A1", values=rows, value_input_option="RAW")
+            ss.batch_update({"requests": dashboard_format_requests(ws.id, len(rows), width, styles)})
+        except Exception:
+            self._reset()
+            raise
+
     # --- вкладка «Статистика» ---
     def write_stats(self, grid: list[list]) -> None:
         """Перезаписує вкладку «Статистика» і (один раз) створює діаграми."""
@@ -331,3 +350,57 @@ class SheetWriter:
             ws.append_rows(new_rows, value_input_option="RAW")
             # Після додавання перечитуємо номери рядків, щоб наступні оновлення лягли правильно.
             self._row_index.pop(tab.title, None)
+
+
+# --- оформлення вкладки «Ефективність куратора» ---
+_COLORS = {
+    "title": {"bg": (0.11, 0.24, 0.47), "fg": (1, 1, 1), "bold": True, "size": 15},
+    "section": {"bg": (0.80, 0.88, 0.98), "bold": True, "size": 12},
+    "colheader": {"bg": (0.93, 0.93, 0.93), "bold": True},
+    "subheader": {"bold": True, "italic": True},
+    "note": {"italic": True, "fg": (0.4, 0.4, 0.4)},
+}
+
+
+def _rgb(c):
+    return {"red": c[0], "green": c[1], "blue": c[2]}
+
+
+def dashboard_format_requests(sheet_id: int, n_rows: int, width: int, styles: list[tuple[int, str]]) -> list[dict]:
+    def rng(r0, r1, c0=0, c1=width):
+        return {"sheetId": sheet_id, "startRowIndex": r0, "endRowIndex": r1,
+                "startColumnIndex": c0, "endColumnIndex": c1}
+
+    reqs: list[dict] = [
+        # скидаємо старе оформлення (розділи можуть зсуватися, коли список «чекають» змінюється)
+        {"repeatCell": {"range": rng(0, n_rows + 100), "cell": {"userEnteredFormat": {}},
+                        "fields": "userEnteredFormat"}},
+        {"repeatCell": {"range": rng(0, n_rows + 100, width - 1, width),
+                        "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP",
+                                                       "textFormat": {"italic": True,
+                                                                      "foregroundColor": _rgb((0.35, 0.35, 0.35))}}},
+                        "fields": "userEnteredFormat(wrapStrategy,textFormat)"}},
+        {"repeatCell": {"range": rng(0, n_rows + 100, 1, width - 1),
+                        "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
+                        "fields": "userEnteredFormat.horizontalAlignment"}},
+    ]
+    for row, style in styles:
+        st = _COLORS.get(style)
+        if not st:
+            continue
+        fmt: dict = {"textFormat": {"bold": st.get("bold", False), "italic": st.get("italic", False)}}
+        if "size" in st:
+            fmt["textFormat"]["fontSize"] = st["size"]
+        if "fg" in st:
+            fmt["textFormat"]["foregroundColor"] = _rgb(st["fg"])
+        fields = "userEnteredFormat.textFormat"
+        if "bg" in st:
+            fmt["backgroundColor"] = _rgb(st["bg"])
+            fields = "userEnteredFormat(textFormat,backgroundColor)"
+        reqs.append({"repeatCell": {"range": rng(row, row + 1), "cell": {"userEnteredFormat": fmt},
+                                    "fields": fields}})
+    for c0, c1, px in ((0, 1, 330), (1, width - 1, 115), (width - 1, width, 380)):
+        reqs.append({"updateDimensionProperties": {
+            "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": c0, "endIndex": c1},
+            "properties": {"pixelSize": px}, "fields": "pixelSize"}})
+    return reqs

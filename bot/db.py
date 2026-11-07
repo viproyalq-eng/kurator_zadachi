@@ -478,6 +478,20 @@ class Database:
         self.conn.commit()
         return self.conn.total_changes - before
 
+    def live_messages(self, since_iso: str | None) -> list[tuple[int, str, str, str]]:
+        """(chat_id, sender, date, text) — повідомлення від запуску бота, по чатах і в часі."""
+        sql = "SELECT chat_id, sender, date, text FROM messages"
+        params: list = []
+        if since_iso:
+            sql += " WHERE date >= ?"
+            params.append(since_iso)
+        return [tuple(r) for r in self.conn.execute(sql + " ORDER BY chat_id, date, id", params)]
+
+    def alive_clients(self, client_sender: str, since_iso: str) -> int:
+        return self.conn.execute(
+            """SELECT COUNT(DISTINCT m.chat_id) FROM messages m JOIN clients c ON c.chat_id = m.chat_id
+               WHERE c.excluded=0 AND m.sender=? AND m.date >= ?""", (client_sender, since_iso)).fetchone()[0]
+
     def owner_ids(self) -> set[int]:
         return {r[0] for r in self.conn.execute("SELECT owner_user_id FROM business_connections")}
 

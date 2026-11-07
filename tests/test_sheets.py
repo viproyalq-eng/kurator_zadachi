@@ -6,6 +6,10 @@ from bot.sheets import (CLIENTS_HEADER, CLIENTS_TAB, MESSAGES_HEADER, MESSAGES_T
 
 class FakeWS:
     _next_id = 1
+    row_count = 1000
+
+    def add_rows(self, n):
+        self.row_count += n
 
     def __init__(self, title):
         self.id = FakeWS._next_id
@@ -281,3 +285,17 @@ def test_task_lists_move_between_tabs(writer):
     w.write_task_lists([["07.11.2026", "Оля", "", "2"]], [["07.11.2026", "Іван", "", "1", "", "", "07.11.2026 10:00"]])
     assert [r[1] for r in ss.tabs["Задачі"].rows[1:]] == ["Оля"]
     assert [r[1] for r in ss.tabs["Виконані задачі"].rows[1:]] == ["Іван"]
+
+
+
+def test_write_dashboard(writer):
+    w, ss = writer
+    batches = []
+    ss.batch_update = lambda body: batches.append(body)
+    rows = [["📈 Ефективність куратора — Віктор", "", ""], ["", "", ""], ["⏱ 1. Швидкість", "", ""]]
+    w.write_dashboard("Ефективність куратора", rows, [(0, "title"), (2, "section")])
+    assert ss.tabs["Ефективність куратора"].rows[0][0].startswith("📈")
+    reqs = batches[0]["requests"]
+    colored = [r for r in reqs if "backgroundColor" in r.get("repeatCell", {}).get("cell", {})
+               .get("userEnteredFormat", {})]
+    assert [r["repeatCell"]["range"]["startRowIndex"] for r in colored] == [0, 2]

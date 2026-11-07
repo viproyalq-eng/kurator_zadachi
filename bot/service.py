@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ STAGE_MISSED = "бот не встиг написати — задача Вік�
 
 ROUND_NO_KEY = "round_no"
 ROUND_START_KEY = "round_started_at"
+ROUND_HISTORY_KEY = "rounds_history"
 
 TASK_STALE = "stale"
 TASK_MISSED = "missed"
@@ -363,6 +365,9 @@ class BotService:
         if total == 0 or covered < total:
             return False
         days = max(1, (now_utc - datetime.fromisoformat(start)).days)
+        history = json.loads(self.db.get_setting(ROUND_HISTORY_KEY) or "[]")
+        history.append({"no": number, "start": start, "end": now_utc.isoformat(), "total": total})
+        self.db.set_setting(ROUND_HISTORY_KEY, json.dumps(history))
         self.db.set_setting(ROUND_NO_KEY, str(number + 1))
         self.db.set_setting(ROUND_START_KEY, now_utc.isoformat())
         if self.notify_group:
@@ -373,6 +378,21 @@ class BotService:
                 f"контакту (кому писали менше {self.cfg.tasks_min_days} днів тому — трохи пізніше). "
                 f"Партнерів і холодних у колі немає.")
         return True
+
+    def efficiency(self, now_utc: datetime):
+        """Усі дані для вкладки «Ефективність куратора»."""
+        from .efficiency import LiveMessage, RoundState, build_efficiency
+        from .stats import BOT_STARTED_KEY
+        since = self.db.get_setting(BOT_STARTED_KEY)
+        live = [LiveMessage(cid, sender, datetime.fromisoformat(d), text or "")
+                for cid, sender, d, text in self.db.live_messages(since)]
+        number, covered, total = self.round_progress(now_utc)
+        _, start = self.round_info(now_utc)
+        rounds = RoundState(number, datetime.fromisoformat(start), covered, total, self.cfg.tasks_per_day,
+                            json.loads(self.db.get_setting(ROUND_HISTORY_KEY) or "[]"))
+        alive = self.db.alive_clients(SENDER_CLIENT, (now_utc - timedelta(days=30)).isoformat())
+        return build_efficiency(self.db.all_clients(include_excluded=True), self.db.all_tasks(), live, alive,
+                                rounds, now_utc, self.cfg.timezone, self.cfg.curator_name, SENDER_CLIENT)
 
     def apply_not_client_flags(self, flags: dict[int, bool]) -> int:
         """Переносить позначки «Не клієнт» з таблиці в базу. Повертає, скільки змінилося."""

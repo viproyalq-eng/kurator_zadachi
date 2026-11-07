@@ -349,6 +349,9 @@ async def test_refresh_stats_writes_grid(app):
         def write_task_lists(self, open_rows, done_rows):
             pass
 
+        def write_dashboard(self, title, rows, styles):
+            pass
+
     app.sheets = Sheets()
     await app.refresh_stats()
     assert written and written[0][0][0] == "Статистика куратора"
@@ -457,6 +460,9 @@ async def test_cold_list_written_to_sheet(app):
         def write_task_lists(self, open_rows, done_rows):
             written["tasks"] = (open_rows, done_rows)
 
+        def write_dashboard(self, title, rows, styles):
+            written["dashboard"] = (title, rows, styles)
+
         def queue_client(self, *a, **k):
             pass
 
@@ -464,6 +470,8 @@ async def test_cold_list_written_to_sheet(app):
     await app.refresh_stats()
     row = written["cold"][0]
     assert row[0] == "Olya" and row[2] == "301" and row[7] == "https://web.telegram.org/a/#301"
+    title, rows, styles = written["dashboard"]
+    assert title == "Ефективність куратора" and rows[0][0].startswith("📈")
     p = written["partners"]
     assert len(p) == 1 and p[0][0] == "Andriy B." and p[0][1] == "@andriy_b"
     assert p[0][3] == "07.11.2026 11:00" and p[0][4] == "новий" and p[0][9] == "https://t.me/andriy_b"

@@ -19,6 +19,7 @@ from .logic import client_display_name, message_text
 from .notify import Notifier
 from .service import BotService, IncomingMessage, cold_row, partner_row
 from .sheets import SheetWriter, explain_error
+from .efficiency import EFFICIENCY_TAB
 from .importer import ImportError_, load_bytes, parse_export
 from .stats import BOT_STARTED_KEY, build_report, report_grid, summary_text
 from .tasks import LAST_RUN_KEY, fmt_date, format_tasks_message, is_due
@@ -495,8 +496,10 @@ class BotApp:
         partner_rows = [partner_row(c, self.cfg.timezone) for c in self.db.partner_clients()]
         open_rows, done_rows = self.service.task_lists()
         self.service.tasks_dirty = False
+        eff = self.service.efficiency(datetime.now(timezone.utc))
         try:
             await asyncio.to_thread(self.sheets.write_task_lists, open_rows, done_rows)
+            await asyncio.to_thread(self.sheets.write_dashboard, EFFICIENCY_TAB, eff.rows, eff.styles)
             await asyncio.to_thread(self.sheets.write_stats, grid)
             await asyncio.to_thread(self.sheets.write_partner_list, partner_rows)
             await asyncio.to_thread(self.sheets.write_cold_list, cold_rows)

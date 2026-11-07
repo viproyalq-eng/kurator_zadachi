@@ -13,6 +13,7 @@ class FakeWS:
         FakeWS._next_id += 1
         self._title = title
         self._row_count = 1000
+        self._col_count = 26
         self.rows = []
         self.fail = False
 
@@ -27,6 +28,13 @@ class FakeWS:
     @property
     def row_count(self):
         return self._row_count
+
+    @property
+    def col_count(self):
+        return self._col_count
+
+    def add_cols(self, n):
+        self._col_count += n
 
     def add_rows(self, n):
         self._row_count += n
@@ -82,8 +90,10 @@ class FakeSS:
         return list(self.tabs.values())
 
     def add_worksheet(self, title, rows, cols):
-        self.tabs[title] = FakeWS(title)
-        return self.tabs[title]
+        ws = FakeWS(title)
+        ws._row_count, ws._col_count = rows, cols   # як Google: розмір вкладки — як попросили
+        self.tabs[title] = ws
+        return ws
 
     def worksheet(self, title):
         for ws in self.tabs.values():
@@ -263,7 +273,12 @@ def _chart_api(ss):
                     if ws.id == props["sheetId"]:
                         ws._title = props["title"]
             if "addChart" in r:
-                sid = r["addChart"]["chart"]["position"]["overlayPosition"]["anchorCell"]["sheetId"]
+                anchor = r["addChart"]["chart"]["position"]["overlayPosition"]["anchorCell"]
+                sid = anchor["sheetId"]
+                ws = next(w for w in ss.tabs.values() if w.id == sid)
+                if anchor["columnIndex"] >= ws.col_count:   # як Google: не можна за межами вкладки
+                    raise RuntimeError(f"GridCoordinate.columnIndex[{anchor['columnIndex']}] is after last "
+                                       f"column in grid[{ws.col_count - 1}]")
                 charts.setdefault(sid, []).append(r["addChart"]["chart"]["spec"]["title"])
 
     ss.fetch_sheet_metadata = fetch_sheet_metadata
@@ -371,3 +386,17 @@ def test_write_stages_adds_color_rules_once(writer):
     tab = ss.tabs["Етапи клієнтів"]
     assert tab.rows[1] == ["Іван", "✅ 03.11.26", "✅ 05.11.26"]
     assert len(batches) == 1 and len(rules[tab.id]) == 4      # ✅ ❌ ➖ ⚠️ — лише один раз
+
+
+
+def test_dashboard_charts_fit_into_new_narrow_tab(writer):
+    """Регресія: нова вузька вкладка («Ефективність клієнта», 10 стовпців) + діаграми праворуч."""
+    from bot.course import COURSE_TAB, course_chart_specs
+    w, ss = writer
+    batches, charts = _chart_api(ss)
+    rows = [["x"] * 10 for _ in range(30)]
+    w.write_dashboard(COURSE_TAB, rows, [(0, "title")], course_chart_specs)
+    ws = ss.tabs[COURSE_TAB]
+    assert ws.col_count >= 11 + 8 and len(charts[ws.id]) == 3
+    w.write_dashboard(COURSE_TAB, rows, [(0, "title")], course_chart_specs)
+    assert len(charts[ws.id]) == 3                      # без дублів

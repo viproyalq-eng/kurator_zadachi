@@ -234,8 +234,10 @@ class SheetWriter:
             if charts:
                 from .stats import add_chart_requests
                 existing = self._chart_titles(ss, ws)
-                missing = add_chart_requests(ws.id, charts(ws.id), existing, chart_col or width + 1)
+                col = chart_col or width + 1
+                missing = add_chart_requests(ws.id, charts(ws.id), existing, col)
                 if missing:
+                    _ensure_cols(ws, col + CHART_SPAN_COLS)
                     ss.batch_update({"requests": missing})
         except Exception:
             self._reset()
@@ -301,6 +303,8 @@ class SheetWriter:
                 existing = {c.get("spec", {}).get("title", "") for c in sheet.get("charts", [])}
         missing = chart_requests(ws.id, existing)
         if missing:
+            from .stats import CHART_COLUMN
+            _ensure_cols(ws, CHART_COLUMN + CHART_SPAN_COLS)
             ss.batch_update({"requests": format_requests(ws.id) + missing})
 
     def _reset(self) -> None:
@@ -394,6 +398,15 @@ class SheetWriter:
             ws.append_rows(new_rows, value_input_option="RAW")
             # Після додавання перечитуємо номери рядків, щоб наступні оновлення лягли правильно.
             self._row_index.pop(tab.title, None)
+
+
+CHART_SPAN_COLS = 8  # скільки стовпців праворуч займає діаграма
+
+
+def _ensure_cols(ws, needed: int) -> None:
+    """Google не дозволяє ставити діаграму за межами вкладки — за потреби додаємо стовпці."""
+    if ws.col_count < needed:
+        ws.add_cols(needed - ws.col_count)
 
 
 # --- оформлення вкладки «Ефективність куратора» ---

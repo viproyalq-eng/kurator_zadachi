@@ -511,3 +511,11 @@ def cold_row(client: Client, tz) -> list:
     return [client.name or "", f"@{client.username}" if client.username else "", str(client.chat_id),
             _fmt_iso(client.cold_since, tz), _fmt_iso(client.last_message_at, tz), client.last_from or "",
             STATUS_LABELS.get(client.status, client.status), chat_url(client.chat_id, client.username)]
+
+
+def partner_row(client: Client, tz) -> list:
+    """Рядок вкладки «Партнери»."""
+    return [client.name or "", f"@{client.username}" if client.username else "", str(client.chat_id),
+            _fmt_iso(client.partner_since, tz), client.client_type, _fmt_iso(client.first_seen, tz),
+            _fmt_iso(client.last_message_at, tz), client.last_from or "", _fmt_iso(client.cold_since, tz),
+            chat_url(client.chat_id, client.username)]

@@ -34,6 +34,9 @@ NOT_CLIENT_INDEX = CLIENTS_HEADER.index(NOT_CLIENT_COLUMN)  # J — заповн
 TASKS_HEADER = ["Дата задачі", "Клієнт", "Username", "ID чату", "Останній контакт",
                 "Днів без контакту", "Виконано", "Текст дотику", "Клієнт відповів", "Тип задачі", "Посилання на чат"]
 
+PARTNERS_TAB = "Партнери"
+PARTNERS_HEADER = ["Клієнт", "Username", "ID чату", "Партнер з", "Тип (як прийшов)", "Перший контакт",
+                   "Останній контакт", "Хто писав останнім", "Холодний з", "Посилання на чат"]
 COLD_TAB = "Холодні"
 COLD_HEADER = ["Клієнт", "Username", "ID чату", "Холодний з", "Останній контакт", "Хто писав останнім",
                "Статус", "Посилання на чат"]
@@ -183,20 +186,26 @@ class SheetWriter:
         self._worksheet(TASKS_TAB, TASKS_HEADER)
         return self._open().title
 
-    # --- вкладка «Холодні» (переписується цілком) ---
-    def write_cold_list(self, rows: list[list]) -> None:
+    # --- вкладки-списки «Партнери» і «Холодні» (переписуються цілком) ---
+    def write_list(self, title: str, header: list[str], rows: list[list]) -> None:
         try:
             ss = self._open()
             titles = [ws.title for ws in ss.worksheets()]
-            if COLD_TAB in titles:
-                ws = ss.worksheet(COLD_TAB)
+            if title in titles:
+                ws = ss.worksheet(title)
                 ws.clear()
             else:
-                ws = ss.add_worksheet(title=COLD_TAB, rows=max(100, len(rows) + 10), cols=len(COLD_HEADER))
-            ws.update(range_name="A1", values=[COLD_HEADER] + rows, value_input_option="RAW")
+                ws = ss.add_worksheet(title=title, rows=max(100, len(rows) + 10), cols=len(header))
+            ws.update(range_name="A1", values=[header] + rows, value_input_option="RAW")
         except Exception:
             self._reset()
             raise
+
+    def write_cold_list(self, rows: list[list]) -> None:
+        self.write_list(COLD_TAB, COLD_HEADER, rows)
+
+    def write_partner_list(self, rows: list[list]) -> None:
+        self.write_list(PARTNERS_TAB, PARTNERS_HEADER, rows)
 
     # --- вкладка «Статистика» ---
     def write_stats(self, grid: list[list]) -> None:

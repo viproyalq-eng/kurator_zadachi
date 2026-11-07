@@ -248,6 +248,11 @@ class Database:
         rows = self.conn.execute("SELECT * FROM clients WHERE cold_since IS NOT NULL ORDER BY cold_since DESC")
         return [Client(**dict(r)) for r in rows]
 
+    def partner_clients(self) -> list[Client]:
+        rows = self.conn.execute(
+            f"SELECT * FROM clients WHERE status='{STATUS_PARTNER}' AND excluded=0 ORDER BY partner_since DESC")
+        return [Client(**dict(r)) for r in rows]
+
     def find_by_username(self, username: str) -> Client | None:
         row = self.conn.execute("SELECT * FROM clients WHERE lower(username)=?",
                                 (username.lstrip("@").lower(),)).fetchone()

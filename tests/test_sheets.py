@@ -255,3 +255,17 @@ def test_partner_columns_updated_but_not_client_kept(writer):
     w.queue_client(100, row[:10] + ["Партнер", "06.11.2026 10:00"])
     w.flush()
     assert ss.tabs[CLIENTS_TAB].rows[1][9:] == ["так", "Партнер", "06.11.2026 10:00"]
+
+
+
+def test_list_tab_is_rewritten(writer):
+    w, ss = writer
+
+    def clear():
+        ss.tabs["Партнери"].rows = []
+
+    w.write_partner_list([["Іван", "@ivan"], ["Олена", ""]])
+    ss.tabs["Партнери"].clear = clear
+    w.write_partner_list([["Олена", ""]])
+    rows = ss.tabs["Партнери"].rows
+    assert rows[0][0] == "Клієнт" and rows[1] == ["Олена", ""] and len(rows) == 2

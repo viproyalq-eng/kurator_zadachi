@@ -17,7 +17,7 @@ from .config import Config
 from .db import STATUS_INVESTOR, STATUS_PARTNER, Client, Connection, Database
 from .logic import client_display_name, message_text
 from .notify import Notifier
-from .service import BotService, IncomingMessage, cold_row
+from .service import BotService, IncomingMessage, cold_row, partner_row
 from .sheets import SheetWriter, explain_error
 from .importer import ImportError_, load_bytes, parse_export
 from .stats import BOT_STARTED_KEY, build_report, report_grid, summary_text
@@ -488,8 +488,10 @@ class BotApp:
             return
         grid = report_grid(self._build_report(), self.cfg.timezone)
         cold_rows = [cold_row(c, self.cfg.timezone) for c in self.db.cold_clients() if not c.excluded]
+        partner_rows = [partner_row(c, self.cfg.timezone) for c in self.db.partner_clients()]
         try:
             await asyncio.to_thread(self.sheets.write_stats, grid)
+            await asyncio.to_thread(self.sheets.write_partner_list, partner_rows)
             await asyncio.to_thread(self.sheets.write_cold_list, cold_rows)
         except Exception as e:  # noqa: BLE001
             log.exception("Не вдалося оновити вкладку «Статистика»")

@@ -340,6 +340,12 @@ async def test_refresh_stats_writes_grid(app):
         def write_stats(self, grid):
             written.append(grid)
 
+        def write_partner_list(self, rows):
+            pass
+
+        def write_cold_list(self, rows):
+            pass
+
     app.sheets = Sheets()
     await app.refresh_stats()
     assert written and written[0][0][0] == "Статистика куратора"
@@ -430,6 +436,9 @@ async def test_cold_list_written_to_sheet(app):
     app.db.upsert_client(Client(301, None, "Olya", None, CLIENT_OLD, "2025-01-18T10:00:00+00:00",
                                 "2025-01-18T10:00:00+00:00", "клієнт", None, None))
     app.service.set_cold(301, True, datetime.now(timezone.utc))
+    app.db.upsert_client(Client(302, None, "Andriy B.", "andriy_b", "новий", "2026-11-01T10:00:00+00:00",
+                                "2026-11-06T10:00:00+00:00", "Віктор", None, None))
+    app.service.set_status(302, "партнер", datetime(2026, 11, 7, 9, 0, tzinfo=timezone.utc))
     written = {}
 
     class Sheets:
@@ -439,6 +448,9 @@ async def test_cold_list_written_to_sheet(app):
         def write_cold_list(self, rows):
             written["cold"] = rows
 
+        def write_partner_list(self, rows):
+            written["partners"] = rows
+
         def queue_client(self, *a, **k):
             pass
 
@@ -446,3 +458,6 @@ async def test_cold_list_written_to_sheet(app):
     await app.refresh_stats()
     row = written["cold"][0]
     assert row[0] == "Olya" and row[2] == "301" and row[7] == "https://web.telegram.org/a/#301"
+    p = written["partners"]
+    assert len(p) == 1 and p[0][0] == "Andriy B." and p[0][1] == "@andriy_b"
+    assert p[0][3] == "07.11.2026 11:00" and p[0][4] == "новий" and p[0][9] == "https://t.me/andriy_b"

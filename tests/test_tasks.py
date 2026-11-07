@@ -132,8 +132,10 @@ def test_message_format():
     text = format_tasks_message(TODAY, tasks, NOW, 10, yesterday=(15, 20))
     assert "Задачі на 06.11.2026" in text
     assert "Вчора виконано: 15 з 20" in text
-    assert '<a href="tg://user?id=1">Іван &lt;Петренко&gt;</a> (@ivan) — 45 дн. тому' in text
-    assert "2. ✅ " in text and "Без імені" in text
+    assert "1. Іван &lt;Петренко&gt; · @ivan — останній контакт 22.09.2026 (45 дн. тому)" in text
+    # без username — посилання на чат у веб-версії Telegram
+    assert '2. ✅ Без імені · <a href="https://web.telegram.org/a/#2">відкрити чат</a>' in text
+    assert "tg://user" not in text
     assert "Виконано: 1 з 2" in text
 
 
@@ -149,6 +151,7 @@ def test_task_row_days_at_creation():
     assert row[0] == "06.11.2026" and row[3] == "1" and row[5] == "45"
     assert row[6] == "09.11.2026 07:00"
     assert row[7] == "Добрый день! Как дела?" and row[8] == "10.11.2026 07:00"
+    assert row[10] == "https://t.me/ivan"
 
 
 def test_old_database_is_migrated(tmp_path):

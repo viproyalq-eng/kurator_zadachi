@@ -119,7 +119,7 @@ async def test_reply_notifies_group_and_cancels_reminder(tmp_path):
     await e.client_says("Я з Києва, раніше не інвестував", at(6, 12, 40))
     assert len(e.group) == 1
     assert "відповів на привітання" in e.group[0] and "ваша черга" in e.group[0]
-    assert "Я з Києва, раніше не інвестував" in e.group[0] and 'tg://user?id=100' in e.group[0]
+    assert "Я з Києва, раніше не інвестував" in e.group[0] and "Іван · @ivan" in e.group[0]
     assert e.client.stage == "відповів на привітання"
     await e.tick(at(6, 14, 1))
     assert len(e.sent) == 1  # нагадування скасовано
@@ -236,7 +236,7 @@ async def test_morning_message_has_sections(tmp_path):
     tasks = e.service.create_daily_tasks("2026-11-07", at(7, 7))
     text = format_tasks_message("2026-11-07", tasks, at(7, 7), 10)
     assert "Мовчать після привітання і нагадування</b> — 1" in text
-    assert "1. <a href=\"tg://user?id=100\">Іван</a> (@ivan) — не відповів" in text
+    assert "1. Іван · @ivan — не відповів" in text
 
 
 async def test_no_group_notifier_is_fine(tmp_path):

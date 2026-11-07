@@ -199,7 +199,7 @@ class BotApp:
         y_tasks = self.db.tasks_for((today - timedelta(days=1)).isoformat())
         yesterday = (sum(1 for t in y_tasks if t.done_at), len(y_tasks)) if y_tasks else None
         text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days,
-                                    yesterday=yesterday, header=header)
+                                    yesterday=yesterday, header=header, tz=self.cfg.timezone)
         await self.send_to_tasks_chat(text)
 
     async def _scheduler_loop(self) -> None:
@@ -323,7 +323,7 @@ class BotApp:
         now = datetime.now(timezone.utc)
         today = self._today_local()
         tasks = self.service.create_daily_tasks(today.isoformat(), now)
-        text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days)
+        text = format_tasks_message(today.isoformat(), tasks, now, self.cfg.tasks_min_days, tz=self.cfg.timezone)
         await update.message.reply_html(text, disable_web_page_preview=True)
 
     # --- партнери ---

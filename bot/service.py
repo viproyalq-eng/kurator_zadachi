@@ -12,7 +12,7 @@ from .db import CLIENT_NEW, CLIENT_OLD, STATUS_INVESTOR, STATUS_PARTNER, Client,
 from .logic import SENDER_BOT, SENDER_CLIENT, fmt_dt, is_bonus
 from .sheets import TASKS_TAB
 from .schedule import in_send_window, next_send_time, reply_deadline
-from .tasks import cutoff_utc, person_link, task_row
+from .tasks import chat_url, cutoff_utc, person_link, task_row
 from .notify import Notifier
 
 log = logging.getLogger(__name__)
@@ -426,4 +426,5 @@ def client_row(client: Client, tz) -> list:
         client.last_from or "", _fmt_iso(client.welcome_sent_at, tz), client.stage or "",
         "так" if client.excluded else "",
         STATUS_LABELS.get(client.status, client.status), _fmt_iso(client.partner_since, tz),
+        chat_url(client.chat_id, client.username),
     ]

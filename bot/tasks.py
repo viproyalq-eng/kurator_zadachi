@@ -37,12 +37,29 @@ def fmt_date(d: str | date) -> str:
     return d.strftime("%d.%m.%Y")
 
 
-def person_link(chat_id: int, name: str | None, username: str | None) -> str:
-    # tg://user?id= відкриває чат з людиною у Віктора (він з нею вже листувався).
-    link = f'<a href="tg://user?id={chat_id}">{html.escape(name or "Без імені")}</a>'
+def chat_url(chat_id: int, username: str | None) -> str:
+    """Посилання на чат з людиною: t.me за username, інакше — веб-версія Telegram за ID.
+    Веб-посилання відкриває чат, бо Віктор уже листувався з цією людиною."""
     if username:
-        link += f" (@{html.escape(username)})"
-    return link
+        return f"https://t.me/{username}"
+    return f"https://web.telegram.org/a/#{chat_id}"
+
+
+def person_link(chat_id: int, name: str | None, username: str | None) -> str:
+    """Ім'я + @username (Telegram сам робить його клікабельним) або посилання «відкрити чат»."""
+    name_html = html.escape(name or "Без імені")
+    if username:
+        return f"{name_html} · @{html.escape(username)}"
+    return f'{name_html} · <a href="{chat_url(chat_id, None)}">відкрити чат</a>'
+
+
+def fmt_contact(iso_value: str | None, now_utc: datetime, tz: ZoneInfo) -> str:
+    """«18.01.2025 (658 дн. тому)» — точна дата останнього спілкування."""
+    if not iso_value:
+        return "давно"
+    d = days_since(iso_value, now_utc)
+    when = datetime.fromisoformat(iso_value).astimezone(tz).strftime("%d.%m.%Y")
+    return f"{when} ({d} дн. тому)"
 
 
 def client_link(task: Task) -> str:
@@ -62,7 +79,8 @@ TASK_KIND_LABELS = {
 
 
 def format_tasks_message(task_date: str, tasks: list[Task], now_utc: datetime, min_days: int,
-                         yesterday: tuple[int, int] | None = None, header: str | None = None) -> str:
+                         yesterday: tuple[int, int] | None = None, header: str | None = None,
+                         tz: ZoneInfo = ZoneInfo("Europe/Kyiv")) -> str:
     """Текст для групи «Задачі куратора» (HTML), розбитий на розділи за типом задачі."""
     lines = [header or f"☀️ <b>Задачі на {fmt_date(task_date)}</b>"]
     if yesterday and yesterday[1]:
@@ -81,8 +99,7 @@ def format_tasks_message(task_date: str, tasks: list[Task], now_utc: datetime, m
             number += 1
             mark = "✅ " if t.done_at else ""
             if kind == "stale":
-                d = days_since(t.last_contact_at, now_utc)
-                detail = f"{d} дн. тому" if d is not None else "давно"
+                detail = "останній контакт " + fmt_contact(t.last_contact_at, now_utc, tz)
             else:
                 detail = t.note or ""
             lines.append(f"{number}. {mark}{client_link(t)}" + (f" — {detail}" if detail else ""))
@@ -104,4 +121,4 @@ def task_row(task: Task, tz: ZoneInfo) -> list:
     text = (task.done_text or "")[:500]
     return [fmt_date(task.task_date), task.name or "", f"@{task.username}" if task.username else "",
             str(task.chat_id), last, "" if days is None else str(days), done, text, replied,
-            TASK_KIND_LABELS.get(task.kind or "stale", task.kind)]
+            TASK_KIND_LABELS.get(task.kind or "stale", task.kind), chat_url(task.chat_id, task.username)]
